@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-
+#!/usr/bin/env python3
 import os
 import shutil
 import sys
@@ -7,7 +6,7 @@ import fileinput
 from optparse import OptionParser
 
 def sh(command):
-    return os.popen(command).read()
+    return os.popen(command).read().strip()
 
 def bundle_path(binary_name):
     return "%s.app" % binary_name
@@ -37,7 +36,7 @@ def copy_binary(binary_name):
 
 def apply_plist_template(plist_file, version):
     for line in fileinput.input(plist_file, inplace=1):
-        print (line.rstrip().replace('${VERSION}', version))
+        print(line.rstrip().replace('${VERSION}', version))
 
 def create_bundle_symlink(binary_name, symlink_name):
     os.symlink(os.path.basename(binary_name),
@@ -80,7 +79,7 @@ def main():
 
     if options.deps:
         print("> bundling dependencies")
-        sh(" ".join(["TOOLS/dylib-unhell.py", target_binary(binary_name)]))
+        print(sh(" ".join(["TOOLS/dylib-unhell.py", target_binary(binary_name)])))
 
     print("done.")
 

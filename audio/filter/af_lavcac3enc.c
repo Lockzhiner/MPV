@@ -68,7 +68,7 @@ struct priv {
     struct mp_aframe *in_frame;
     struct mp_aframe_pool *out_pool;
 
-    struct AVCodec        *lavc_acodec;
+    const struct AVCodec  *lavc_acodec;
     struct AVCodecContext *lavc_actx;
     int bit_rate;
     int out_samples;    // upper bound on encoded output per AC3 frame
@@ -163,46 +163,47 @@ static void process(struct mp_filter *f)
                 break;
             if (lavc_ret < 0 && lavc_ret != AVERROR(EAGAIN)) {
                 MP_FATAL(f, "Encode failed (receive).\n");
-                goto done;
+                goto error;
             }
         }
         AVFrame *frame = NULL;
         struct mp_frame input = mp_pin_out_read(s->in_pin);
         // The following code assumes no sample data buffering in the encoder.
-        if (input.type == MP_FRAME_EOF) {
+        switch (input.type) {
+        case MP_FRAME_NONE:
+            goto done; // no data yet
+        case MP_FRAME_EOF:
             mp_pin_in_write(f->ppins[1], input);
-            return;
-        } else if (input.type == MP_FRAME_AUDIO) {
+            goto done;
+        case MP_FRAME_AUDIO:
             TA_FREEP(&s->in_frame);
             s->in_frame = input.data;
             frame = mp_frame_to_av(input, NULL);
             if (!frame)
-                goto done;
+                goto error;
             if (mp_aframe_get_channels(s->in_frame) < s->opts->min_channel_num) {
                 // Just pass it through.
                 s->in_frame = NULL;
                 mp_pin_in_write(f->ppins[1], input);
-                return;
+                goto done;
             }
             if (!mp_aframe_config_equals(s->in_frame, s->cur_format)) {
                 if (!reinit(f))
-                    goto done;
+                    goto error;
             }
-        } else if (input.type) {
-            goto done;
-        } else {
-            return; // no data yet
+            break;
+        default: goto error; // unexpected packet type
         }
         int lavc_ret = avcodec_send_frame(s->lavc_actx, frame);
         av_frame_free(&frame);
         if (lavc_ret < 0 && lavc_ret != AVERROR(EAGAIN)) {
             MP_FATAL(f, "Encode failed (send).\n");
-            goto done;
+            goto error;
         }
     }
 
     if (!s->in_frame)
-        goto done;
+        goto error;
 
     out = mp_aframe_create();
     mp_aframe_set_format(out, AF_FORMAT_S_AC3);
@@ -210,7 +211,7 @@ static void process(struct mp_filter *f)
     mp_aframe_set_rate(out, 48000);
 
     if (mp_aframe_pool_allocate(s->out_pool, out, s->out_samples) < 0)
-        goto done;
+        goto error;
 
     int sstride = mp_aframe_get_sstride(out);
 
@@ -239,7 +240,7 @@ static void process(struct mp_filter *f)
 
     uint8_t **planes = mp_aframe_get_data_rw(out);
     if (!planes)
-        goto done;
+        goto error;
     char *buf = planes[0];
     memcpy(buf, hdr, header_len);
     memcpy(buf + header_len, pkt.data, pkt.size);
@@ -250,8 +251,10 @@ static void process(struct mp_filter *f)
     mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
     out = NULL;
 
-    err = 0;
 done:
+    err = false;
+    // fall through
+error:
     av_packet_unref(&pkt);
     talloc_free(out);
     if (err)
@@ -375,12 +378,12 @@ const struct mp_user_filter_entry af_lavcac3enc = {
             .encoder = "ac3",
         },
         .options = (const struct m_option[]) {
-            OPT_FLAG("tospdif", add_iec61937_header, 0),
-            OPT_CHOICE_OR_INT("bitrate", bit_rate, 0, 32, 640,
-                            ({"auto", 0}, {"default", 0})),
-            OPT_INTRANGE("minch", min_channel_num, 0, 2, 6),
-            OPT_STRING("encoder", encoder, 0),
-            OPT_KEYVALUELIST("o", avopts, 0),
+            {"tospdif", OPT_FLAG(add_iec61937_header)},
+            {"bitrate", OPT_CHOICE(bit_rate,
+                {"auto", 0}, {"default", 0}), M_RANGE(32, 640)},
+            {"minch", OPT_INT(min_channel_num), M_RANGE(2, 6)},
+            {"encoder", OPT_STRING(encoder)},
+            {"o", OPT_KEYVALUELIST(avopts)},
             {0}
         },
     },

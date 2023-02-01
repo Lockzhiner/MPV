@@ -15,6 +15,7 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -28,9 +29,12 @@
 #include <libavutil/intreadwrite.h>
 #include <libavutil/pixdesc.h>
 
+#include "config.h"
+
 #include "mpv_talloc.h"
 #include "common/global.h"
 #include "common/msg.h"
+#include "options/m_config.h"
 #include "options/options.h"
 #include "misc/bstr.h"
 #include "common/av_common.h"
@@ -59,14 +63,10 @@ static void uninit_avctx(struct mp_filter *vd);
 static int get_buffer2_direct(AVCodecContext *avctx, AVFrame *pic, int flags);
 static enum AVPixelFormat get_format_hwdec(struct AVCodecContext *avctx,
                                            const enum AVPixelFormat *pix_fmt);
+static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
+                          struct bstr name);
 
 #define HWDEC_DELAY_QUEUE_COUNT 2
-
-// Maximum number of surfaces the player wants to buffer.
-// This number might require adjustment depending on whatever the player does;
-// for example, if vo_gpu increases the number of reference surfaces for
-// interpolation, this value has to be increased too.
-#define HWDEC_EXTRA_SURFACES 6
 
 #define OPT_BASE_STRUCT struct vd_lavc_params
 
@@ -84,6 +84,10 @@ struct vd_lavc_params {
     int software_fallback;
     char **avopts;
     int dr;
+    char *hwdec_api;
+    char *hwdec_codecs;
+    int hwdec_image_format;
+    int hwdec_extra_frames;
 };
 
 static const struct m_opt_choice_alternatives discard_names[] = {
@@ -95,26 +99,30 @@ static const struct m_opt_choice_alternatives discard_names[] = {
     {"all",         AVDISCARD_ALL},
     {0}
 };
-#define OPT_DISCARD(name, field, flags) \
-    OPT_GENERAL(int, name, field, flags, .type = CONF_TYPE_CHOICE, \
-                .priv = (void *)discard_names)
+#define OPT_DISCARD(field) OPT_CHOICE_C(field, discard_names)
 
 const struct m_sub_options vd_lavc_conf = {
     .opts = (const m_option_t[]){
-        OPT_FLAG("fast", fast, 0),
-        OPT_FLAG("show-all", show_all, 0),
-        OPT_DISCARD("skiploopfilter", skip_loop_filter, 0),
-        OPT_DISCARD("skipidct", skip_idct, 0),
-        OPT_DISCARD("skipframe", skip_frame, 0),
-        OPT_DISCARD("framedrop", framedrop, 0),
-        OPT_INT("threads", threads, M_OPT_MIN, .min = 0),
-        OPT_FLAG("bitexact", bitexact, 0),
-        OPT_FLAG("assume-old-x264", old_x264, 0),
-        OPT_FLAG("check-hw-profile", check_hw_profile, 0),
-        OPT_CHOICE_OR_INT("software-fallback", software_fallback, 0, 1, INT_MAX,
-                          ({"no", INT_MAX}, {"yes", 1})),
-        OPT_KEYVALUELIST("o", avopts, 0),
-        OPT_FLAG("dr", dr, 0),
+        {"vd-lavc-fast", OPT_FLAG(fast)},
+        {"vd-lavc-show-all", OPT_FLAG(show_all)},
+        {"vd-lavc-skiploopfilter", OPT_DISCARD(skip_loop_filter)},
+        {"vd-lavc-skipidct", OPT_DISCARD(skip_idct)},
+        {"vd-lavc-skipframe", OPT_DISCARD(skip_frame)},
+        {"vd-lavc-framedrop", OPT_DISCARD(framedrop)},
+        {"vd-lavc-threads", OPT_INT(threads), M_RANGE(0, DBL_MAX)},
+        {"vd-lavc-bitexact", OPT_FLAG(bitexact)},
+        {"vd-lavc-assume-old-x264", OPT_FLAG(old_x264)},
+        {"vd-lavc-check-hw-profile", OPT_FLAG(check_hw_profile)},
+        {"vd-lavc-software-fallback", OPT_CHOICE(software_fallback,
+            {"no", INT_MAX}, {"yes", 1}), M_RANGE(1, INT_MAX)},
+        {"vd-lavc-o", OPT_KEYVALUELIST(avopts)},
+        {"vd-lavc-dr", OPT_FLAG(dr)},
+        {"hwdec", OPT_STRING(hwdec_api),
+            .help = hwdec_opt_help,
+            .flags = M_OPT_OPTIONAL_PARAM | UPDATE_HWDEC},
+        {"hwdec-codecs", OPT_STRING(hwdec_codecs)},
+        {"hwdec-image-format", OPT_IMAGEFORMAT(hwdec_image_format)},
+        {"hwdec-extra-frames", OPT_INT(hwdec_extra_frames), M_RANGE(0, 256)},
         {0}
     },
     .size = sizeof(struct vd_lavc_params),
@@ -127,18 +135,26 @@ const struct m_sub_options vd_lavc_conf = {
         .skip_frame = AVDISCARD_DEFAULT,
         .framedrop = AVDISCARD_NONREF,
         .dr = 1,
+        .hwdec_api = "no",
+        .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1",
+        // Maximum number of surfaces the player wants to buffer. This number
+        // might require adjustment depending on whatever the player does;
+        // for example, if vo_gpu increases the number of reference surfaces for
+        // interpolation, this value has to be increased too.
+        .hwdec_extra_frames = 6,
     },
 };
 
 struct hwdec_info {
     char name[64];
-    char method_name[16]; // non-unique name describing the hwdec method
+    char method_name[24]; // non-unique name describing the hwdec method
     const AVCodec *codec; // implemented by this codec
     enum AVHWDeviceType lavc_device; // if not NONE, get a hwdevice
     bool copying; // if true, outputs sw frames, or copy to sw ourselves
     enum AVPixelFormat pix_fmt; // if not NONE, select in get_format
     bool use_hw_frames; // set AVCodecContext.hw_frames_ctx
     bool use_hw_device; // set AVCodecContext.hw_device_ctx
+    unsigned int flags; // HWDEC_FLAG_*
 
     // for internal sorting
     int auto_pos;
@@ -147,7 +163,8 @@ struct hwdec_info {
 
 typedef struct lavc_ctx {
     struct mp_log *log;
-    struct MPOpts *opts;
+    struct m_config_cache *opts_cache;
+    struct vd_lavc_params *opts;
     struct mp_codec_params *codec;
     AVCodecContext *avctx;
     AVFrame *pic;
@@ -156,9 +173,8 @@ typedef struct lavc_ctx {
     AVRational codec_timebase;
     enum AVDiscard skip_frame;
     bool flushing;
-    bool eof_returned;
+    struct lavc_state state;
     const char *decoder;
-    bool hwdec_requested;
     bool hwdec_failed;
     bool hwdec_notified;
 
@@ -199,19 +215,33 @@ typedef struct lavc_ctx {
     struct mp_decoder public;
 } vd_ffmpeg_ctx;
 
+enum {
+    HWDEC_FLAG_AUTO         = (1 << 0), // prioritize in autoprobe order
+    HWDEC_FLAG_WHITELIST    = (1 << 1), // whitelist for auto-safe
+};
+
+struct autoprobe_info {
+    const char *method_name;
+    unsigned int flags;         // HWDEC_FLAG_*
+};
+
 // Things not included in this list will be tried last, in random order.
-static const char *const hwdec_autoprobe_order[] = {
-    "d3d11va",
-    "dxva2",
-    "dxva2-copy",
-    "d3d11va-copy",
-    "nvdec",
-    "nvdec-copy",
-    "vdpau",
-    "vdpau-copy",
-    "vaapi",
-    "vaapi-copy",
-    0
+const struct autoprobe_info hwdec_autoprobe_info[] = {
+    {"d3d11va",         HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"dxva2",           HWDEC_FLAG_AUTO},
+    {"dxva2-copy",      HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"d3d11va-copy",    HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"nvdec",           HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"nvdec-copy",      HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"vaapi",           HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"vaapi-copy",      HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"vdpau",           HWDEC_FLAG_AUTO},
+    {"vdpau-copy",      HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"mmal",            HWDEC_FLAG_AUTO},
+    {"mmal-copy",       HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"videotoolbox",    HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {"videotoolbox-copy", HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+    {0}
 };
 
 static int hwdec_compare(const void *p1, const void *p2)
@@ -249,9 +279,14 @@ static void add_hwdec_item(struct hwdec_info **infos, int *num_infos,
 
     info.rank = *num_infos;
     info.auto_pos = INT_MAX;
-    for (int x = 0; hwdec_autoprobe_order[x]; x++) {
-        if (strcmp(hwdec_autoprobe_order[x], info.method_name) == 0)
-            info.auto_pos = x;
+
+    for (int x = 0; hwdec_autoprobe_info[x].method_name; x++) {
+        const struct autoprobe_info *entry = &hwdec_autoprobe_info[x];
+        if (strcmp(entry->method_name, info.method_name) == 0) {
+            info.flags |= entry->flags;
+            if (info.flags & HWDEC_FLAG_AUTO)
+                info.auto_pos = x;
+        }
     }
 
     MP_TARRAY_APPEND(NULL, *infos, *num_infos, info);
@@ -409,14 +444,19 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     vd_ffmpeg_ctx *ctx = vd->priv;
     const char *codec = ctx->codec->codec;
 
+    m_config_cache_update(ctx->opts_cache);
+
     bstr opt = bstr0(ctx->opts->hwdec_api);
 
     bool hwdec_requested = !bstr_equals0(opt, "no");
     bool hwdec_auto_all = bstr_equals0(opt, "auto") ||
                           bstr_equals0(opt, "yes") ||
                           bstr_equals0(opt, "");
-    bool hwdec_auto_copy = bstr_equals0(opt, "auto-copy");
-    bool hwdec_auto = hwdec_auto_all || hwdec_auto_copy;
+    bool hwdec_auto_safe = bstr_equals0(opt, "auto-safe") ||
+                           bstr_equals0(opt, "auto-copy-safe");
+    bool hwdec_auto_copy = bstr_equals0(opt, "auto-copy") ||
+                           bstr_equals0(opt, "auto-copy-safe");
+    bool hwdec_auto = hwdec_auto_all || hwdec_auto_copy || hwdec_auto_safe;
 
     if (!hwdec_requested) {
         MP_VERBOSE(vd, "No hardware decoding requested.\n");
@@ -428,8 +468,6 @@ static void select_and_set_hwdec(struct mp_filter *vd)
         int num_hwdecs = 0;
         add_all_hwdec_methods(&hwdecs, &num_hwdecs);
 
-        ctx->hwdec_requested = true;
-
         for (int n = 0; n < num_hwdecs; n++) {
             struct hwdec_info *hwdec = &hwdecs[n];
 
@@ -439,6 +477,9 @@ static void select_and_set_hwdec(struct mp_filter *vd)
 
             if (!hwdec_auto && !(bstr_equals0(opt, hwdec->method_name) ||
                                  bstr_equals0(opt, hwdec->name)))
+                continue;
+
+            if (hwdec_auto_safe && !(hwdec->flags & HWDEC_FLAG_WHITELIST))
                 continue;
 
             MP_VERBOSE(vd, "Looking at hwdec %s...\n", hwdec->name);
@@ -493,27 +534,30 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     }
 }
 
-int hwdec_validate_opt(struct mp_log *log, const m_option_t *opt,
-                       struct bstr name, struct bstr param)
+static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
+                          struct bstr name)
 {
-    if (bstr_equals0(param, "help")) {
-        struct hwdec_info *hwdecs = NULL;
-        int num_hwdecs = 0;
-        add_all_hwdec_methods(&hwdecs, &num_hwdecs);
+    struct hwdec_info *hwdecs = NULL;
+    int num_hwdecs = 0;
+    add_all_hwdec_methods(&hwdecs, &num_hwdecs);
 
-        mp_info(log, "Valid values (with alternative full names):\n");
+    mp_info(log, "Valid values (with alternative full names):\n");
 
-        for (int n = 0; n < num_hwdecs; n++) {
-            struct hwdec_info *hwdec = &hwdecs[n];
+    for (int n = 0; n < num_hwdecs; n++) {
+        struct hwdec_info *hwdec = &hwdecs[n];
 
-            mp_info(log, "  %s (%s)\n", hwdec->method_name, hwdec->name);
-        }
-
-        talloc_free(hwdecs);
-
-        return M_OPT_EXIT;
+        mp_info(log, "  %s (%s)\n", hwdec->method_name, hwdec->name);
     }
-    return 0;
+
+    talloc_free(hwdecs);
+
+    mp_info(log, "  auto (yes '')\n");
+    mp_info(log, "  no\n");
+    mp_info(log, "  auto-safe\n");
+    mp_info(log, "  auto-copy\n");
+    mp_info(log, "  auto-copy-safe\n");
+
+    return M_OPT_EXIT;
 }
 
 static void force_fallback(struct mp_filter *vd)
@@ -543,8 +587,10 @@ static void reinit(struct mp_filter *vd)
 static void init_avctx(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
-    struct vd_lavc_params *lavc_param = ctx->opts->vd_lavc_params;
+    struct vd_lavc_params *lavc_param = ctx->opts;
     struct mp_codec_params *c = ctx->codec;
+
+    m_config_cache_update(ctx->opts_cache);
 
     assert(!ctx->avctx);
 
@@ -575,10 +621,7 @@ static void init_avctx(struct mp_filter *vd)
         goto error;
     avctx->codec_type = AVMEDIA_TYPE_VIDEO;
     avctx->codec_id = lavc_codec->id;
-
-#if LIBAVCODEC_VERSION_MICRO >= 100
     avctx->pkt_timebase = ctx->codec_timebase;
-#endif
 
     ctx->pic = av_frame_alloc();
     if (!ctx->pic)
@@ -616,7 +659,9 @@ static void init_avctx(struct mp_filter *vd)
     if (!ctx->use_hwdec && ctx->vo && lavc_param->dr) {
         avctx->opaque = vd;
         avctx->get_buffer2 = get_buffer2_direct;
+#if LIBAVCODEC_VERSION_MAJOR < 60
         avctx->thread_safe_callbacks = 1;
+#endif
     }
 
     avctx->flags |= lavc_param->bitexact ? AV_CODEC_FLAG_BITEXACT : 0;
@@ -743,7 +788,7 @@ static int init_generic_hwaccel(struct mp_filter *vd, enum AVPixelFormat hw_fmt)
     // 1 surface is already included by libavcodec. The field is 0 if the
     // hwaccel supports dynamic surface allocation.
     if (new_fctx->initial_pool_size)
-        new_fctx->initial_pool_size += HWDEC_EXTRA_SURFACES - 1;
+        new_fctx->initial_pool_size += ctx->opts->hwdec_extra_frames - 1;
 
     const struct hwcontext_fns *fns =
         hwdec_get_hwcontext_fns(new_fctx->device_ctx->type);
@@ -840,7 +885,7 @@ static int get_buffer2_direct(AVCodecContext *avctx, AVFrame *pic, int flags)
 
     // We assume that different alignments are just different power-of-2s.
     // Thus, a higher alignment always satisfies a lower alignment.
-    int stride_align = 0;
+    int stride_align = MP_IMAGE_BYTE_ALIGN;
     for (int n = 0; n < AV_NUM_DATA_POINTERS; n++)
         stride_align = MPMAX(stride_align, linesize_align[n]);
 
@@ -907,14 +952,14 @@ fallback:
     return avcodec_default_get_buffer2(avctx, pic, flags);
 }
 
-static bool prepare_decoding(struct mp_filter *vd)
+static void prepare_decoding(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
     AVCodecContext *avctx = ctx->avctx;
-    struct vd_lavc_params *opts = ctx->opts->vd_lavc_params;
+    struct vd_lavc_params *opts = ctx->opts;
 
-    if (!avctx || ctx->hwdec_failed)
-        return false;
+    if (!avctx)
+        return;
 
     int drop = ctx->framedrop_flags;
     if (drop == 1) {
@@ -930,16 +975,15 @@ static bool prepare_decoding(struct mp_filter *vd)
 
     if (ctx->hwdec_request_reinit)
         reset_avctx(vd);
-
-    return true;
 }
 
 static void handle_err(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
-    struct vd_lavc_params *opts = ctx->opts->vd_lavc_params;
+    struct vd_lavc_params *opts = ctx->opts;
 
-    MP_WARN(vd, "Error while decoding frame!\n");
+    MP_WARN(vd, "Error while decoding frame%s!\n",
+            ctx->use_hwdec ? " (hardware decoding)" : "");
 
     if (ctx->use_hwdec) {
         ctx->hwdec_fail_count += 1;
@@ -948,107 +992,125 @@ static void handle_err(struct mp_filter *vd)
     }
 }
 
-static bool do_send_packet(struct mp_filter *vd, struct demux_packet *pkt)
+static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
     AVCodecContext *avctx = ctx->avctx;
 
-    if (!prepare_decoding(vd))
-        return false;
+    if (ctx->num_requeue_packets && ctx->requeue_packets[0] != pkt)
+        return AVERROR(EAGAIN); // cannot consume the packet
+
+    if (ctx->hwdec_failed)
+        return AVERROR(EAGAIN);
+
+    if (!ctx->avctx)
+        return AVERROR_EOF;
+
+    prepare_decoding(vd);
 
     if (avctx->skip_frame == AVDISCARD_ALL)
-        return true;
+        return 0;
 
     AVPacket avpkt;
     mp_set_av_packet(&avpkt, pkt, &ctx->codec_timebase);
 
     int ret = avcodec_send_packet(avctx, pkt ? &avpkt : NULL);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-        return false;
+        return ret;
 
-    if (ctx->hw_probing && ctx->num_sent_packets < 32) {
+    if (ctx->hw_probing && ctx->num_sent_packets < 32 &&
+        ctx->opts->software_fallback <= 32)
+    {
         pkt = pkt ? demux_copy_packet(pkt) : NULL;
         MP_TARRAY_APPEND(ctx, ctx->sent_packets, ctx->num_sent_packets, pkt);
     }
 
     if (ret < 0)
         handle_err(vd);
-    return true;
+    return ret;
 }
 
-static bool send_queued(struct mp_filter *vd)
+static void send_queued_packet(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
 
-    while (ctx->num_requeue_packets && do_send_packet(vd, ctx->requeue_packets[0]))
-    {
+    assert(ctx->num_requeue_packets);
+    assert(!ctx->hw_probing);
+
+    if (send_packet(vd, ctx->requeue_packets[0]) != AVERROR(EAGAIN)) {
         talloc_free(ctx->requeue_packets[0]);
         MP_TARRAY_REMOVE_AT(ctx->requeue_packets, ctx->num_requeue_packets, 0);
     }
-
-    return ctx->num_requeue_packets == 0;
-}
-
-static bool send_packet(struct mp_filter *vd, struct demux_packet *pkt)
-{
-    if (!send_queued(vd))
-        return false;
-
-    return do_send_packet(vd, pkt);
 }
 
 // Returns whether decoder is still active (!EOF state).
-static bool decode_frame(struct mp_filter *vd)
+static int decode_frame(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
     AVCodecContext *avctx = ctx->avctx;
 
-    if (!prepare_decoding(vd))
-        return true;
+    if (!avctx)
+        return AVERROR_EOF;
+
+    prepare_decoding(vd);
+
+    // Re-send old packets (typically after a hwdec fallback during init).
+    if (ctx->num_requeue_packets)
+        send_queued_packet(vd);
 
     int ret = avcodec_receive_frame(avctx, ctx->pic);
-    if (ret == AVERROR_EOF) {
-        // If flushing was initialized earlier and has ended now, make it start
-        // over in case we get new packets at some point in the future. This
-        // must take the delay queue into account, so avctx returns EOF until
-        // the delay queue has been drained.
-        if (!ctx->num_delay_queue)
-            reset_avctx(vd);
-        return false;
-    } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
-        handle_err(vd);
+    if (ret < 0) {
+        if (ret == AVERROR_EOF) {
+            // If flushing was initialized earlier and has ended now, make it
+            // start over in case we get new packets at some point in the future.
+            // This must take the delay queue into account, so avctx returns EOF
+            // until the delay queue has been drained.
+            if (!ctx->num_delay_queue)
+                reset_avctx(vd);
+        } else if (ret == AVERROR(EAGAIN)) {
+            // just retry after caller writes a packet
+        } else {
+            handle_err(vd);
+        }
+        return ret;
     }
 
-    if (!ctx->pic->buf[0])
-        return true;
-
-    ctx->hwdec_fail_count = 0;
+    // If something was decoded successfully, it must return a frame with valid
+    // data.
+    assert(ctx->pic->buf[0]);
 
     struct mp_image *mpi = mp_image_from_av_frame(ctx->pic);
     if (!mpi) {
         av_frame_unref(ctx->pic);
-        return true;
+        return ret;
     }
-    assert(mpi->planes[0] || mpi->planes[3]);
+
+    if (mpi->imgfmt == IMGFMT_CUDA && !mpi->planes[0]) {
+        MP_ERR(vd, "CUDA frame without data. This is a FFmpeg bug.\n");
+        talloc_free(mpi);
+        handle_err(vd);
+        return AVERROR_BUG;
+    }
+
+    ctx->hwdec_fail_count = 0;
+
     mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
     mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);
 
-#if LIBAVCODEC_VERSION_MICRO >= 100
     mpi->pkt_duration =
         mp_pts_from_av(ctx->pic->pkt_duration, &ctx->codec_timebase);
-#endif
 
     av_frame_unref(ctx->pic);
 
     MP_TARRAY_APPEND(ctx, ctx->delay_queue, ctx->num_delay_queue, mpi);
-    return true;
+    return ret;
 }
 
-static bool receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
+static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
 
-    bool progress = decode_frame(vd);
+    int ret = decode_frame(vd);
 
     if (ctx->hwdec_failed) {
         // Failed hardware decoding? Try again in software.
@@ -1062,22 +1124,24 @@ static bool receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         ctx->requeue_packets = pkts;
         ctx->num_requeue_packets = num_pkts;
 
-        send_queued(vd);
-        progress = decode_frame(vd);
+        return 0; // force retry
     }
 
-    if (!ctx->num_delay_queue)
-        return progress;
+    if (ret == AVERROR(EAGAIN) && ctx->num_requeue_packets)
+        return 0; // force retry, so send_queued_packet() gets called
 
-    if (ctx->num_delay_queue <= ctx->max_delay_queue && progress)
-        return true;
+    if (!ctx->num_delay_queue)
+        return ret;
+
+    if (ctx->num_delay_queue <= ctx->max_delay_queue && ret != AVERROR_EOF)
+        return AVERROR(EAGAIN);
 
     struct mp_image *res = ctx->delay_queue[0];
     MP_TARRAY_REMOVE_AT(ctx->delay_queue, ctx->num_delay_queue, 0);
 
     res = res ? mp_img_swap_to_native(res) : NULL;
     if (!res)
-        return progress;
+        return AVERROR_UNKNOWN;
 
     if (ctx->use_hwdec && ctx->hwdec.copying && res->hwctx) {
         struct mp_image *sw = mp_image_hw_download(res, ctx->hwdec_swpool);
@@ -1087,11 +1151,11 @@ static bool receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
             MP_ERR(vd, "Could not copy back hardware decoded frame.\n");
             ctx->hwdec_fail_count = INT_MAX - 1; // force fallback
             handle_err(vd);
-            return true;
+            return AVERROR_UNKNOWN;
         }
     }
 
-    if (!ctx->hwdec_notified && ctx->hwdec_requested) {
+    if (!ctx->hwdec_notified) {
         if (ctx->use_hwdec) {
             MP_INFO(vd, "Using hardware decoding (%s).\n",
                     ctx->hwdec.method_name);
@@ -1109,7 +1173,7 @@ static bool receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
     }
 
     *out_frame = MAKE_FRAME(MP_FRAME_VIDEO, res);
-    return true;
+    return 0;
 }
 
 static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
@@ -1149,7 +1213,7 @@ static void process(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
 
-    lavc_process(vd, &ctx->eof_returned, send_packet, receive_frame);
+    lavc_process(vd, &ctx->state, send_packet, receive_frame);
 }
 
 static void reset(struct mp_filter *vd)
@@ -1158,7 +1222,7 @@ static void reset(struct mp_filter *vd)
 
     flush_all(vd);
 
-    ctx->eof_returned = false;
+    ctx->state = (struct lavc_state){0};
     ctx->framedrop_flags = 0;
 }
 
@@ -1194,7 +1258,8 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     vd_ffmpeg_ctx *ctx = vd->priv;
     ctx->log = vd->log;
-    ctx->opts = vd->global->opts;
+    ctx->opts_cache = m_config_cache_alloc(ctx, vd->global, &vd_lavc_conf);
+    ctx->opts = ctx->opts_cache->opts;
     ctx->codec = codec;
     ctx->decoder = talloc_strdup(ctx, decoder);
     ctx->hwdec_swpool = mp_image_pool_new(ctx);

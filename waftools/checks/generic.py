@@ -1,14 +1,15 @@
 import os
 import inflector
+from distutils.version import StrictVersion
 from waflib.ConfigSet import ConfigSet
 from waflib import Utils
 
 __all__ = [
     "check_pkg_config", "check_pkg_config_mixed", "check_pkg_config_mixed_all",
     "check_pkg_config_cflags", "check_cc", "check_statement", "check_libs",
-    "check_headers", "compose_checks", "check_true", "any_version",
+    "check_headers", "compose_checks", "any_check", "check_true", "any_version",
     "load_fragment", "check_stub", "check_ctx_vars", "check_program",
-    "check_pkg_config_datadir"]
+    "check_pkg_config_datadir", "check_macos_sdk"]
 
 any_version = None
 
@@ -134,7 +135,7 @@ def _check_pkg_config(_dyn_libs, _pkgc_args, *args, **kw_ext):
 
 def check_headers(*headers, **kw_ext):
     def undef_others(ctx, headers, found):
-        not_found_hs = set(headers) - set([found])
+        not_found_hs = set(headers) - {found}
         for not_found_h in not_found_hs:
             ctx.undefine(inflector.define_key(not_found_h))
 
@@ -179,6 +180,11 @@ def compose_checks(*checks):
         return all([check(ctx, dependency_identifier) for check in checks])
     return fn
 
+def any_check(*checks):
+    def fn(ctx, dependency_identifier):
+        return any(check(ctx, dependency_identifier) for check in checks)
+    return fn
+
 def load_fragment(fragment):
     file_path = os.path.join(os.path.dirname(__file__), '..', 'fragments',
                              fragment)
@@ -186,3 +192,13 @@ def load_fragment(fragment):
     fragment_code = fp.read()
     fp.close()
     return fragment_code
+
+def check_macos_sdk(version):
+    def fn(ctx, dependency_identifier):
+        if ctx.env.MACOS_SDK_VERSION:
+            if StrictVersion(ctx.env.MACOS_SDK_VERSION) >= StrictVersion(version):
+                ctx.define(inflector.define_key(dependency_identifier), 1)
+                return True
+        return False
+
+    return fn

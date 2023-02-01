@@ -43,15 +43,16 @@ enum {
     VO_EVENT_AMBIENT_LIGHTING_CHANGED   = 1 << 4,
     // Special mechanism for making resizing with Cocoa react faster
     VO_EVENT_LIVE_RESIZING              = 1 << 5,
-    // Window fullscreen state changed via external influence.
-    VO_EVENT_FULLSCREEN_STATE           = 1 << 6,
+    // For VOCTRL_GET_HIDPI_SCALE changes.
+    VO_EVENT_DPI                        = 1 << 6,
     // Special thing for encode mode (vo_driver.initially_blocked).
     // Part of VO_EVENTS_USER to make vo_is_ready_for_frame() work properly.
     VO_EVENT_INITIAL_UNBLOCK            = 1 << 7,
+    VO_EVENT_FOCUS                      = 1 << 8,
 
     // Set of events the player core may be interested in.
-    VO_EVENTS_USER = VO_EVENT_RESIZE | VO_EVENT_WIN_STATE |
-                     VO_EVENT_FULLSCREEN_STATE | VO_EVENT_INITIAL_UNBLOCK,
+    VO_EVENTS_USER = VO_EVENT_RESIZE | VO_EVENT_WIN_STATE | VO_EVENT_DPI |
+                     VO_EVENT_INITIAL_UNBLOCK | VO_EVENT_FOCUS,
 };
 
 enum mp_voctrl {
@@ -65,8 +66,11 @@ enum mp_voctrl {
     VOCTRL_RESUME,
 
     VOCTRL_SET_PANSCAN,
-    VOCTRL_SET_EQUALIZER,               // struct voctrl_set_equalizer_args*
-    VOCTRL_GET_EQUALIZER,               // struct voctrl_get_equalizer_args*
+    VOCTRL_SET_EQUALIZER,
+
+    // Triggered by any change to mp_vo_opts. This is for convenience. In theory,
+    // you could install your own listener.
+    VOCTRL_VO_OPTS_CHANGED,
 
     /* private to vo_gpu */
     VOCTRL_LOAD_HWDEC_API,
@@ -80,13 +84,6 @@ enum mp_voctrl {
     VOCTRL_PREINIT,
     VOCTRL_UNINIT,
     VOCTRL_RECONFIG,
-
-    VOCTRL_FULLSCREEN,
-    VOCTRL_ONTOP,
-    VOCTRL_BORDER,
-    VOCTRL_ALL_WORKSPACES,
-
-    VOCTRL_GET_FULLSCREEN,
 
     VOCTRL_UPDATE_WINDOW_TITLE,         // char*
     VOCTRL_UPDATE_PLAYBACK_STATE,       // struct voctrl_playback_state*
@@ -103,7 +100,7 @@ enum mp_voctrl {
     VOCTRL_GET_UNFS_WINDOW_SIZE,        // int[2] (w/h)
     VOCTRL_SET_UNFS_WINDOW_SIZE,        // int[2] (w/h)
 
-    VOCTRL_GET_WIN_STATE,               // int* (VO_WIN_STATE_* flags)
+    VOCTRL_GET_FOCUSED,                 // bool*
 
     // char *** (NULL terminated array compatible with CONF_TYPE_STRING_LIST)
     // names for displays the window is on
@@ -122,27 +119,12 @@ enum mp_voctrl {
     VOCTRL_GET_ICC_PROFILE,             // bstr*
     VOCTRL_GET_AMBIENT_LUX,             // int*
     VOCTRL_GET_DISPLAY_FPS,             // double*
-
-    VOCTRL_GET_PREF_DEINT,              // int*
+    VOCTRL_GET_HIDPI_SCALE,             // double*
+    VOCTRL_GET_DISPLAY_RES,             // int[2]
 
     /* private to vo_gpu */
     VOCTRL_EXTERNAL_RESIZE,
 };
-
-// VOCTRL_SET_EQUALIZER
-struct voctrl_set_equalizer_args {
-    const char *name;
-    int value;
-};
-
-// VOCTRL_GET_EQUALIZER
-struct voctrl_get_equalizer_args {
-    const char *name;
-    int *valueptr;
-};
-
-// VOCTRL_GET_WIN_STATE
-#define VO_WIN_STATE_MINIMIZED 1
 
 #define VO_TRUE         true
 #define VO_FALSE        false
@@ -263,6 +245,35 @@ struct vo_frame {
     uint64_t frame_id;
 };
 
+// Presentation feedback. See get_vsync() for how backends should fill this
+// struct.
+struct vo_vsync_info {
+    // mp_time_us() timestamp at which the last queued frame will likely be
+    // displayed (this is in the future, unless the frame is instantly output).
+    // -1 if unset or unsupported.
+    // This implies the latency of the output.
+    int64_t last_queue_display_time;
+
+    // Time between 2 vsync events in microseconds. The difference should be the
+    // from 2 times sampled from the same reference point (it should not be the
+    // difference between e.g. the end of scanout and the start of the next one;
+    // it must be continuous).
+    // -1 if unsupported.
+    //  0 if supported, but no value available yet. It is assumed that the value
+    //    becomes available after enough swap_buffers() calls were done.
+    // >0 values are taken for granted. Very bad things will happen if it's
+    //    inaccurate.
+    int64_t vsync_duration;
+
+    // Number of skipped physical vsyncs at some point in time. Typically, this
+    // value is some time in the past by an offset that equals to the latency.
+    // This value is reset and newly sampled at every swap_buffers() call.
+    // This can be used to detect delayed frames iff you try to call
+    // swap_buffers() for every physical vsync.
+    // -1 if unset or unsupported.
+    int64_t skipped_vsyncs;
+};
+
 struct vo_driver {
     // Encoding functionality, which can be invoked via --o only.
     bool encode;
@@ -374,6 +385,15 @@ struct vo_driver {
      */
     void (*flip_page)(struct vo *vo);
 
+    /*
+     * Return presentation feedback. The implementation should not touch fields
+     * it doesn't support; the info fields are preinitialized to neutral values.
+     * Usually called once after flip_page(), but can be called any time.
+     * The values returned by this are always relative to the last flip_page()
+     * call.
+     */
+    void (*get_vsync)(struct vo *vo, struct vo_vsync_info *info);
+
     /* These optional callbacks can be provided if the GUI framework used by
      * the VO requires entering a message loop for receiving events and does
      * not call vo_wakeup() from a separate thread when there are new events.
@@ -422,6 +442,7 @@ struct vo {
     struct vo_w32_state *w32;
     struct vo_cocoa_state *cocoa;
     struct vo_wayland_state *wl;
+    struct vo_android_state *android;
     struct mp_hwdec_devices *hwdec_devs;
     struct input_ctx *input_ctx;
     struct osd_state *osd;
@@ -466,6 +487,7 @@ bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts);
 void vo_queue_frame(struct vo *vo, struct vo_frame *frame);
 void vo_wait_frame(struct vo *vo);
 bool vo_still_displaying(struct vo *vo);
+void vo_request_wakeup_on_done(struct vo *vo);
 bool vo_has_frame(struct vo *vo);
 void vo_redraw(struct vo *vo);
 bool vo_want_redraw(struct vo *vo);
@@ -479,9 +501,6 @@ void vo_query_formats(struct vo *vo, uint8_t *list);
 void vo_event(struct vo *vo, int event);
 int vo_query_and_reset_events(struct vo *vo, int events);
 struct mp_image *vo_get_current_frame(struct vo *vo);
-void vo_enable_external_renderloop(struct vo *vo);
-void vo_disable_external_renderloop(struct vo *vo);
-bool vo_render_frame_external(struct vo *vo);
 void vo_set_queue_params(struct vo *vo, int64_t offset_us, int num_req_frames);
 int vo_get_num_req_frames(struct vo *vo);
 int64_t vo_get_vsync_interval(struct vo *vo);

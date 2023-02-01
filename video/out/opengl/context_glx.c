@@ -37,8 +37,10 @@
 #define GLX_CONTEXT_ES2_PROFILE_BIT_EXT         0x00000004
 #endif
 
+#include "osdep/timer.h"
 #include "video/out/x11_common.h"
 #include "context.h"
+#include "oml_sync.h"
 #include "utils.h"
 
 struct priv {
@@ -46,6 +48,9 @@ struct priv {
     XVisualInfo *vinfo;
     GLXContext context;
     GLXFBConfig fbc;
+
+    Bool (*XGetSyncValues)(Display*, GLXDrawable, int64_t*, int64_t*, int64_t*);
+    struct oml_sync sync;
 };
 
 static void glx_uninit(struct ra_ctx *ctx)
@@ -64,55 +69,13 @@ static void glx_uninit(struct ra_ctx *ctx)
     vo_x11_uninit(ctx->vo);
 }
 
-static bool create_context_x11_old(struct ra_ctx *ctx, GL *gl)
-{
-    struct priv *p = ctx->priv;
-    Display *display = ctx->vo->x11->display;
-    struct vo *vo = ctx->vo;
-
-    if (p->context)
-        return true;
-
-    if (!p->vinfo) {
-        MP_FATAL(vo, "Can't create a legacy GLX context without X visual\n");
-        return false;
-    }
-
-    GLXContext new_context = glXCreateContext(display, p->vinfo, NULL, True);
-    if (!new_context) {
-        MP_FATAL(vo, "Could not create GLX context!\n");
-        return false;
-    }
-
-    if (!glXMakeCurrent(display, ctx->vo->x11->window, new_context)) {
-        MP_FATAL(vo, "Could not set GLX context!\n");
-        glXDestroyContext(display, new_context);
-        return false;
-    }
-
-    const char *glxstr = glXQueryExtensionsString(display, ctx->vo->x11->screen);
-
-    mpgl_load_functions(gl, (void *)glXGetProcAddressARB, glxstr, vo->log);
-
-    p->context = new_context;
-
-    return true;
-}
-
 typedef GLXContext (*glXCreateContextAttribsARBProc)
     (Display*, GLXFBConfig, GLXContext, Bool, const int*);
 
-static bool create_context_x11_gl3(struct ra_ctx *ctx, GL *gl, int gl_version,
-                                   bool es)
+static bool create_context_x11(struct ra_ctx *ctx, GL *gl, bool es)
 {
     struct priv *p = ctx->priv;
     struct vo *vo = ctx->vo;
-
-    if (p->context)
-        return true;
-
-    if (!ra_gl_ctx_test_version(ctx, gl_version, es))
-        return false;
 
     glXCreateContextAttribsARBProc glXCreateContextAttribsARB =
         (glXCreateContextAttribsARBProc)
@@ -120,9 +83,14 @@ static bool create_context_x11_gl3(struct ra_ctx *ctx, GL *gl, int gl_version,
 
     const char *glxstr =
         glXQueryExtensionsString(vo->x11->display, vo->x11->screen);
-    bool have_ctx_ext = glxstr && !!strstr(glxstr, "GLX_ARB_create_context");
+    if (!glxstr) {
+        MP_ERR(ctx, "GLX did not advertise any extensions\n");
+        return false;
+    }
 
-    if (!(have_ctx_ext && glXCreateContextAttribsARB)) {
+    if (!strstr(glxstr, "GLX_ARB_create_context") ||
+        !glXCreateContextAttribsARB) {
+        MP_ERR(ctx, "GLX does not support GLX_ARB_create_context\n");
         return false;
     }
 
@@ -131,22 +99,48 @@ static bool create_context_x11_gl3(struct ra_ctx *ctx, GL *gl, int gl_version,
 
     if (es) {
         profile_mask = GLX_CONTEXT_ES2_PROFILE_BIT_EXT;
-        if (!(glxstr && strstr(glxstr, "GLX_EXT_create_context_es2_profile")))
+        if (!strstr(glxstr, "GLX_EXT_create_context_es2_profile"))
             return false;
     }
 
     int context_attribs[] = {
-        GLX_CONTEXT_MAJOR_VERSION_ARB, MPGL_VER_GET_MAJOR(gl_version),
-        GLX_CONTEXT_MINOR_VERSION_ARB, MPGL_VER_GET_MINOR(gl_version),
+        GLX_CONTEXT_MAJOR_VERSION_ARB, 0,
+        GLX_CONTEXT_MINOR_VERSION_ARB, 0,
         GLX_CONTEXT_PROFILE_MASK_ARB, profile_mask,
         GLX_CONTEXT_FLAGS_ARB, ctx_flags,
         None
     };
-    vo_x11_silence_xlib(1);
-    GLXContext context = glXCreateContextAttribsARB(vo->x11->display,
-                                                    p->fbc, 0, True,
-                                                    context_attribs);
-    vo_x11_silence_xlib(-1);
+
+    GLXContext context;
+
+    if (!es) {
+        for (int n = 0; mpgl_min_required_gl_versions[n]; n++) {
+            int version = mpgl_min_required_gl_versions[n];
+            MP_VERBOSE(ctx, "Creating OpenGL %d.%d context...\n",
+                       MPGL_VER_P(version));
+
+            context_attribs[1] = MPGL_VER_GET_MAJOR(version);
+            context_attribs[3] = MPGL_VER_GET_MINOR(version);
+
+            vo_x11_silence_xlib(1);
+            context = glXCreateContextAttribsARB(vo->x11->display,
+                                                 p->fbc, 0, True,
+                                                 context_attribs);
+            vo_x11_silence_xlib(-1);
+
+            if (context)
+                break;
+        }
+    } else {
+        context_attribs[1] = 2;
+
+        vo_x11_silence_xlib(1);
+        context = glXCreateContextAttribsARB(vo->x11->display,
+                                             p->fbc, 0, True,
+                                             context_attribs);
+        vo_x11_silence_xlib(-1);
+    }
+
     if (!context)
         return false;
 
@@ -160,6 +154,13 @@ static bool create_context_x11_gl3(struct ra_ctx *ctx, GL *gl, int gl_version,
     p->context = context;
 
     mpgl_load_functions(gl, (void *)glXGetProcAddressARB, glxstr, vo->log);
+
+    if (gl_check_extension(glxstr, "GLX_OML_sync_control")) {
+        p->XGetSyncValues =
+            (void *)glXGetProcAddressARB((const GLubyte *)"glXGetSyncValuesOML");
+    }
+    if (p->XGetSyncValues)
+        MP_VERBOSE(vo, "Using GLX_OML_sync_control.\n");
 
     return true;
 }
@@ -208,9 +209,34 @@ static void set_glx_attrib(int *attribs, int name, int value)
     }
 }
 
+static void update_vsync_oml(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+
+    assert(p->XGetSyncValues);
+
+    int64_t ust, msc, sbc;
+    if (!p->XGetSyncValues(ctx->vo->x11->display, ctx->vo->x11->window,
+                           &ust, &msc, &sbc))
+        ust = msc = sbc = -1;
+
+    oml_sync_swap(&p->sync, ust, msc, sbc);
+}
+
 static void glx_swap_buffers(struct ra_ctx *ctx)
 {
+    struct priv *p = ctx->priv;
+
     glXSwapBuffers(ctx->vo->x11->display, ctx->vo->x11->window);
+
+    if (p->XGetSyncValues)
+        update_vsync_oml(ctx);
+}
+
+static void glx_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
+{
+    struct priv *p = ctx->priv;
+    oml_sync_get_info(&p->sync, info);
 }
 
 static bool glx_init(struct ra_ctx *ctx)
@@ -275,20 +301,12 @@ static bool glx_init(struct ra_ctx *ctx)
         goto uninit;
 
     bool success = false;
-    for (int n = 0; mpgl_preferred_gl_versions[n]; n++) {
-        int version = mpgl_preferred_gl_versions[n];
-        MP_VERBOSE(ctx, "Creating OpenGL %d.%d context...\n",
-                   MPGL_VER_P(version));
-        if (version >= 300) {
-            success = create_context_x11_gl3(ctx, gl, version, false);
-        } else {
-            success = create_context_x11_old(ctx, gl);
-        }
-        if (success)
-            break;
-    }
-    if (!success) // try again for GLES
-        success = create_context_x11_gl3(ctx, gl, 200, true);
+    enum gles_mode mode = ra_gl_ctx_get_glesmode(ctx);
+
+    if (mode == GLES_NO || mode == GLES_AUTO)
+        success = create_context_x11(ctx, gl, false);
+    if (!success && (mode == GLES_YES || mode == GLES_AUTO))
+        success = create_context_x11(ctx, gl, true);
     if (success && !glXIsDirect(vo->x11->display, p->context))
         gl->mpgl_caps |= MPGL_CAP_SW;
     if (!success)
@@ -296,10 +314,13 @@ static bool glx_init(struct ra_ctx *ctx)
 
     struct ra_gl_ctx_params params = {
         .swap_buffers = glx_swap_buffers,
+        .get_vsync    = glx_get_vsync,
     };
 
     if (!ra_gl_ctx_init(ctx, gl, params))
         goto uninit;
+
+    ra_add_native_resource(ctx->ra, "x11", vo->x11->display);
 
     return true;
 
@@ -308,20 +329,6 @@ uninit:
     return false;
 }
 
-static bool glx_init_probe(struct ra_ctx *ctx)
-{
-    if (!glx_init(ctx))
-        return false;
-
-    struct priv *p = ctx->priv;
-    if (!(p->gl.mpgl_caps & MPGL_CAP_VDPAU)) {
-        MP_VERBOSE(ctx, "No vdpau support found - probing more things.\n");
-        glx_uninit(ctx);
-        return false;
-    }
-
-    return true;
-}
 
 static void resize(struct ra_ctx *ctx)
 {
@@ -361,16 +368,5 @@ const struct ra_ctx_fns ra_ctx_glx = {
     .wakeup         = glx_wakeup,
     .wait_events    = glx_wait_events,
     .init           = glx_init,
-    .uninit         = glx_uninit,
-};
-
-const struct ra_ctx_fns ra_ctx_glx_probe = {
-    .type           = "opengl",
-    .name           = "x11probe",
-    .reconfig       = glx_reconfig,
-    .control        = glx_control,
-    .wakeup         = glx_wakeup,
-    .wait_events    = glx_wait_events,
-    .init           = glx_init_probe,
     .uninit         = glx_uninit,
 };

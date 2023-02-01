@@ -34,6 +34,7 @@
 
 #include "common/common.h"
 #include "common/msg.h"
+#include "misc/thread_tools.h"
 #include "stream.h"
 #include "options/m_option.h"
 #include "options/path.h"
@@ -64,6 +65,7 @@ struct priv {
     bool regular_file;
     bool appending;
     int64_t orig_size;
+    struct mp_cancel *cancel;
 };
 
 // Total timeout = RETRY_TIMEOUT * MAX_RETRIES
@@ -73,18 +75,23 @@ struct priv {
 static int64_t get_size(stream_t *s)
 {
     struct priv *p = s->priv;
-    off_t size = lseek(p->fd, 0, SEEK_END);
-    lseek(p->fd, s->pos, SEEK_SET);
-    return size == (off_t)-1 ? -1 : size;
+    struct stat st;
+    if (fstat(p->fd, &st) == 0) {
+        if (st.st_size <= 0 && !s->seekable)
+            st.st_size = -1;
+        if (st.st_size >= 0)
+            return st.st_size;
+    }
+    return -1;
 }
 
-static int fill_buffer(stream_t *s, char *buffer, int max_len)
+static int fill_buffer(stream_t *s, void *buffer, int max_len)
 {
     struct priv *p = s->priv;
 
 #ifndef __MINGW32__
     if (p->use_poll) {
-        int c = s->cancel ? mp_cancel_get_fd(s->cancel) : -1;
+        int c = mp_cancel_get_fd(p->cancel);
         struct pollfd fds[2] = {
             {.fd = p->fd, .events = POLLIN},
             {.fd = c, .events = POLLIN},
@@ -111,47 +118,23 @@ static int fill_buffer(stream_t *s, char *buffer, int max_len)
         if (!p->appending || p->use_poll)
             break;
 
-        if (mp_cancel_wait(s->cancel, RETRY_TIMEOUT))
+        if (mp_cancel_wait(p->cancel, RETRY_TIMEOUT))
             break;
     }
 
     return 0;
 }
 
-static int write_buffer(stream_t *s, char *buffer, int len)
+static int write_buffer(stream_t *s, void *buffer, int len)
 {
     struct priv *p = s->priv;
-    int r = len;
-    int wr;
-    while (r > 0) {
-        wr = write(p->fd, buffer, r);
-        if (wr <= 0)
-            return -1;
-        r -= wr;
-        buffer += wr;
-    }
-    return len - r;
+    return write(p->fd, buffer, len);
 }
 
 static int seek(stream_t *s, int64_t newpos)
 {
     struct priv *p = s->priv;
     return lseek(p->fd, newpos, SEEK_SET) != (off_t)-1;
-}
-
-static int control(stream_t *s, int cmd, void *arg)
-{
-    switch (cmd) {
-    case STREAM_CTRL_GET_SIZE: {
-        int64_t size = get_size(s);
-        if (size >= 0) {
-            *(int64_t *)arg = size;
-            return 1;
-        }
-        break;
-    }
-    }
-    return STREAM_UNSUPPORTED;
 }
 
 static void s_close(stream_t *s)
@@ -193,7 +176,7 @@ static bool check_stream_network(int fd)
 {
     struct statfs fs;
     const char *stypes[] = { "afpfs", "nfs", "smbfs", "webdav", "osxfusefs",
-                             "fuse", "fusefs.sshfs", NULL };
+                             "fuse", "fusefs.sshfs", "macfuse", NULL };
     if (fstatfs(fd, &fs) == 0)
         for (int i=0; stypes[i]; i++)
             if (strcmp(stypes[i], fs.f_fstypename) == 0)
@@ -263,27 +246,30 @@ static bool check_stream_network(int fd)
 }
 #endif
 
-static int open_f(stream_t *stream)
+static int open_f(stream_t *stream, const struct stream_open_args *args)
 {
     struct priv *p = talloc_ptrtype(stream, p);
     *p = (struct priv) {
-        .fd = -1
+        .fd = -1,
     };
     stream->priv = p;
     stream->is_local_file = true;
 
+    bool strict_fs = args->flags & STREAM_LOCAL_FS_ONLY;
     bool write = stream->mode == STREAM_WRITE;
     int m = O_CLOEXEC | (write ? O_RDWR | O_CREAT | O_TRUNC : O_RDONLY);
 
-    char *filename = mp_file_url_to_filename(stream, bstr0(stream->url));
-    if (filename) {
-        stream->path = filename;
-    } else {
-        filename = stream->path;
+    char *filename = stream->path;
+    char *url = "";
+    if (!strict_fs) {
+        char *fn = mp_file_url_to_filename(stream, bstr0(stream->url));
+        if (fn)
+            filename = stream->path = fn;
+        url = stream->url;
     }
 
-    bool is_fdclose = strncmp(stream->url, "fdclose://", 10) == 0;
-    if (strncmp(stream->url, "fd://", 5) == 0 || is_fdclose) {
+    bool is_fdclose = strncmp(url, "fdclose://", 10) == 0;
+    if (strncmp(url, "fd://", 5) == 0 || is_fdclose) {
         char *begin = strstr(stream->url, "://") + 3, *end = NULL;
         p->fd = strtol(begin, &end, 0);
         if (!end || end == begin || end[0]) {
@@ -292,7 +278,7 @@ static int open_f(stream_t *stream)
         }
         if (is_fdclose)
             p->close = true;
-    } else if (!strcmp(filename, "-")) {
+    } else if (!strict_fs && !strcmp(filename, "-")) {
         if (!write) {
             MP_INFO(stream, "Reading from stdin...\n");
             p->fd = 0;
@@ -323,8 +309,8 @@ static int open_f(stream_t *stream)
     if (fstat(p->fd, &st) == 0) {
         if (S_ISDIR(st.st_mode)) {
             stream->is_directory = true;
-            stream->allow_caching = false;
-            MP_INFO(stream, "This is a directory - adding to playlist.\n");
+            if (!(args->flags & STREAM_LESS_NOISE))
+                MP_INFO(stream, "This is a directory - adding to playlist.\n");
         } else if (S_ISREG(st.st_mode)) {
             p->regular_file = true;
 #ifndef __MINGW32__
@@ -351,23 +337,41 @@ static int open_f(stream_t *stream)
     stream->fast_skip = true;
     stream->fill_buffer = fill_buffer;
     stream->write_buffer = write_buffer;
-    stream->control = control;
-    stream->read_chunk = 64 * 1024;
+    stream->get_size = get_size;
     stream->close = s_close;
 
-    if (check_stream_network(p->fd))
+    if (check_stream_network(p->fd)) {
         stream->streaming = true;
+#if HAVE_COCOA
+        if (fcntl(p->fd, F_RDAHEAD, 0) < 0) {
+            MP_VERBOSE(stream, "Cannot disable read ahead on file '%s': %s\n",
+                       filename, mp_strerror(errno));
+        }
+#endif
+    }
 
     p->orig_size = get_size(stream);
+
+    p->cancel = mp_cancel_new(p);
+    if (stream->cancel)
+        mp_cancel_set_parent(p->cancel, stream->cancel);
 
     return STREAM_OK;
 }
 
 const stream_info_t stream_info_file = {
     .name = "file",
-    .open = open_f,
-    .protocols = (const char*const[]){ "file", "", "fd", "fdclose",
-                                       "appending", NULL },
+    .open2 = open_f,
+    .protocols = (const char*const[]){ "file", "", "appending", NULL },
     .can_write = true,
-    .is_safe = true,
+    .local_fs = true,
+    .stream_origin = STREAM_ORIGIN_FS,
+};
+
+const stream_info_t stream_info_fd = {
+    .name = "fd",
+    .open2 = open_f,
+    .protocols = (const char*const[]){ "fd", "fdclose", NULL },
+    .can_write = true,
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

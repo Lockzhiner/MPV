@@ -1,6 +1,7 @@
 #pragma once
 
 #include "video/out/vo.h"
+#include "video/csputils.h"
 
 #include "config.h"
 #include "ra.h"
@@ -10,7 +11,6 @@ struct ra_ctx_opts {
     int want_alpha;      // create an alpha framebuffer if possible
     int debug;           // enable debugging layers/callbacks etc.
     bool probing;        // the backend was auto-probed
-    int swapchain_depth; // max number of images to render ahead
 };
 
 struct ra_ctx {
@@ -44,6 +44,7 @@ struct ra_ctx_fns {
     // optional.
     void (*wakeup)(struct ra_ctx *ctx);
     void (*wait_events)(struct ra_ctx *ctx, int64_t until_time_us);
+    void (*update_render_opts)(struct ra_ctx *ctx);
 
     // Initialize/destroy the 'struct ra' and possibly the underlying VO backend.
     // Not normally called by the user of the ra_ctx.
@@ -63,6 +64,10 @@ struct ra_swapchain {
 struct ra_fbo {
     struct ra_tex *tex;
     bool flip; // rendering needs to be inverted
+
+    // Host system's colorspace that it will be interpreting
+    // the frame buffer as.
+    struct mp_colorspace color_space;
 };
 
 struct ra_swapchain_fns {
@@ -83,6 +88,9 @@ struct ra_swapchain_fns {
     // Performs a buffer swap. This blocks for as long as necessary to meet
     // params.swapchain_depth, or until the next vblank (for vsynced contexts)
     void (*swap_buffers)(struct ra_swapchain *sw);
+
+    // See vo. Usually called after swap_buffers().
+    void (*get_vsync)(struct ra_swapchain *sw, struct vo_vsync_info *info);
 };
 
 // Create and destroy a ra_ctx. This also takes care of creating and destroying
@@ -92,7 +100,11 @@ struct ra_ctx *ra_ctx_create(struct vo *vo, const char *context_type,
 void ra_ctx_destroy(struct ra_ctx **ctx);
 
 struct m_option;
+int ra_ctx_api_help(struct mp_log *log, const struct m_option *opt,
+                    struct bstr name);
 int ra_ctx_validate_api(struct mp_log *log, const struct m_option *opt,
-                        struct bstr name, struct bstr param);
+                        struct bstr name, const char **value);
+int ra_ctx_context_help(struct mp_log *log, const struct m_option *opt,
+                        struct bstr name);
 int ra_ctx_validate_context(struct mp_log *log, const struct m_option *opt,
-                            struct bstr name, struct bstr param);
+                            struct bstr name, const char **value);

@@ -23,9 +23,6 @@
 
 #include "cmd.h"
 
-// For mp_input_put_key(): release all keys that are down.
-#define MP_INPUT_RELEASE_ALL -1
-
 struct input_ctx;
 struct mp_log;
 
@@ -102,7 +99,7 @@ void mp_input_set_mouse_pos(struct input_ctx *ictx, int x, int y);
 // Like mp_input_set_mouse_pos(), but ignore mouse disable option.
 void mp_input_set_mouse_pos_artificial(struct input_ctx *ictx, int x, int y);
 
-void mp_input_get_mouse_pos(struct input_ctx *ictx, int *x, int *y);
+void mp_input_get_mouse_pos(struct input_ctx *ictx, int *x, int *y, int *hover);
 
 // Return whether we want/accept mouse input.
 bool mp_input_mouse_enabled(struct input_ctx *ictx);
@@ -193,10 +190,6 @@ double mp_input_get_delay(struct input_ctx *ictx);
 // Wake up sleeping input loop from another thread.
 void mp_input_wakeup(struct input_ctx *ictx);
 
-// Used to asynchronously abort playback. Needed because the core still can
-// block on network in some situations.
-void mp_input_set_cancel(struct input_ctx *ictx, void (*cb)(void *c), void *c);
-
 // If this returns true, use Right Alt key as Alt Gr to produce special
 // characters. If false, count Right Alt as the modifier Alt key.
 bool mp_input_use_alt_gr(struct input_ctx *ictx);
@@ -207,16 +200,31 @@ bool mp_input_use_media_keys(struct input_ctx *ictx);
 // Like mp_input_parse_cmd_strv, but also run the command.
 void mp_input_run_cmd(struct input_ctx *ictx, const char **cmd);
 
+// Binds a command to a key.
+void mp_input_bind_key(struct input_ctx *ictx, int key, bstr command);
+
 void mp_input_set_repeat_info(struct input_ctx *ictx, int rate, int delay);
 
-void mp_input_pipe_add(struct input_ctx *ictx, const char *filename);
+struct mpv_node mp_input_get_bindings(struct input_ctx *ictx);
+
+void mp_input_sdl_gamepad_add(struct input_ctx *ictx);
 
 struct mp_ipc_ctx;
 struct mp_client_api;
+struct mpv_handle;
 
 // Platform specific implementation, provided by ipc-*.c.
 struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
                                struct mpv_global *global);
+// Start a thread for the given handle and return a socket in out_fd[0] that
+// is served by this thread. If the FD is not full-duplex, then out_fd[0] is
+// the user's read-end, and out_fd[1] the write-end, otherwise out_fd[1] is set
+// to -1.
+//  returns:
+//      true: out_fd[0] and out_fd[1] are set, ownership of h is transferred
+//      false: out_fd are not touched, caller retains ownership of h
+bool mp_ipc_start_anon_client(struct mp_ipc_ctx *ctx, struct mpv_handle *h,
+                              int out_fd[2]);
 void mp_uninit_ipc(struct mp_ipc_ctx *ctx);
 
 // Serialize the given mpv_event structure to JSON. Returns an allocated string.

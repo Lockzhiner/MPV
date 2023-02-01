@@ -22,7 +22,6 @@
 static int open_f(stream_t *stream)
 {
     stream->demuxer = "lavf";
-    stream->allow_caching = false;
 
     return STREAM_OK;
 }
@@ -31,4 +30,5 @@ const stream_info_t stream_info_avdevice = {
     .name = "avdevice",
     .open = open_f,
     .protocols = (const char*const[]){ "avdevice", "av", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

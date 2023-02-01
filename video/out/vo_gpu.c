@@ -98,6 +98,14 @@ static void flip_page(struct vo *vo)
     sw->fns->swap_buffers(sw);
 }
 
+static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+{
+    struct gpu_priv *p = vo->priv;
+    struct ra_swapchain *sw = p->ctx->swapchain;
+    if (sw->fns->get_vsync)
+        sw->fns->get_vsync(sw, info);
+}
+
 static int query_format(struct vo *vo, int format)
 {
     struct gpu_priv *p = vo->priv;
@@ -165,6 +173,15 @@ static void get_and_update_ambient_lighting(struct gpu_priv *p)
     }
 }
 
+static void update_ra_ctx_options(struct vo *vo)
+{
+    struct gpu_priv *p = vo->priv;
+
+    /* Only the alpha option has any runtime toggle ability. */
+    struct gl_video_opts *gl_opts = mp_get_config_group(p->ctx, vo->global, &gl_video_conf);
+    p->ctx->opts.want_alpha = gl_opts->alpha_mode == 1;
+}
+
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct gpu_priv *p = vo->priv;
@@ -187,8 +204,11 @@ static int control(struct vo *vo, uint32_t request, void *data)
         request_hwdec_api(vo);
         return true;
     case VOCTRL_UPDATE_RENDER_OPTS: {
+        update_ra_ctx_options(vo);
         gl_video_configure_queue(p->renderer, vo);
         get_and_update_icc_profile(p);
+        if (p->ctx->fns->update_render_opts)
+            p->ctx->fns->update_render_opts(p->ctx);
         vo->want_redraw = true;
         return true;
     }
@@ -198,7 +218,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_PAUSE:
         if (gl_video_showing_interpolated_frame(p->renderer))
             vo->want_redraw = true;
-        break;
+        return true;
     case VOCTRL_PERFORMANCE_DATA:
         gl_video_perfdata(p->renderer, (struct voctrl_performance_data *)data);
         return true;
@@ -271,11 +291,11 @@ static int preinit(struct vo *vo)
     struct gpu_priv *p = vo->priv;
     p->log = vo->log;
 
-    int alpha_mode;
-    mp_read_option_raw(vo->global, "alpha", &m_option_type_choice, &alpha_mode);
-
     struct ra_ctx_opts opts = p->opts;
-    opts.want_alpha = alpha_mode == 1;
+    struct gl_video_opts *gl_opts =
+        mp_get_config_group(p->ctx, vo->global, &gl_video_conf);
+    opts.want_alpha = gl_opts->alpha_mode == 1;
+    talloc_free(gl_opts);
 
     p->ctx = ra_ctx_create(vo, p->context_type, p->context_name, opts);
     if (!p->ctx)
@@ -303,17 +323,16 @@ err_out:
 
 #define OPT_BASE_STRUCT struct gpu_priv
 static const m_option_t options[] = {
-    OPT_STRING_VALIDATE("gpu-context", context_name, 0, ra_ctx_validate_context),
-    OPT_STRING_VALIDATE("gpu-api", context_type, 0, ra_ctx_validate_api),
-    OPT_FLAG("gpu-debug", opts.debug, 0),
-    OPT_FLAG("gpu-sw", opts.allow_sw, 0),
-    OPT_INTRANGE("swapchain-depth", opts.swapchain_depth, 0, 1, 8),
+    {"gpu-context",
+        OPT_STRING_VALIDATE(context_name, ra_ctx_validate_context),
+        .help = ra_ctx_context_help},
+    {"gpu-api",
+        OPT_STRING_VALIDATE(context_type, ra_ctx_validate_api),
+        .help = ra_ctx_api_help},
+    {"gpu-debug", OPT_FLAG(opts.debug)},
+    {"gpu-sw", OPT_FLAG(opts.allow_sw)},
     {0}
 };
-
-static const struct gpu_priv defaults = { .opts = {
-    .swapchain_depth = 3,
-}};
 
 const struct vo_driver video_out_gpu = {
     .description = "Shader-based GPU Renderer",
@@ -326,10 +345,10 @@ const struct vo_driver video_out_gpu = {
     .get_image = get_image,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
+    .get_vsync = get_vsync,
     .wait_events = wait_events,
     .wakeup = wakeup,
     .uninit = uninit,
     .priv_size = sizeof(struct gpu_priv),
-    .priv_defaults = &defaults,
     .options = options,
 };

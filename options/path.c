@@ -37,6 +37,7 @@
 #include "mpv_talloc.h"
 #include "osdep/io.h"
 #include "osdep/path.h"
+#include "misc/ctype.h"
 
 // In order of decreasing priority: the first has highest priority.
 static const mp_get_platform_path_cb path_resolvers[] = {
@@ -58,8 +59,22 @@ static const char *const config_dirs[] = {
     "home",
     "old_home",
     "osxbundle",
+    "exe_dir",
     "global",
 };
+
+void mp_init_paths(struct mpv_global *global, struct MPOpts *opts)
+{
+    TA_FREEP(&global->configdir);
+
+    const char *force_configdir = getenv("MPV_HOME");
+    if (opts->force_configdir && opts->force_configdir[0])
+        force_configdir = opts->force_configdir;
+    if (!opts->load_config)
+        force_configdir = "";
+
+    global->configdir = talloc_strdup(global, force_configdir);
+}
 
 // Return a platform specific path using a path type as defined in osdep/path.h.
 // Keep in mind that the only way to free the return value is freeing talloc_ctx
@@ -70,15 +85,10 @@ static const char *mp_get_platform_path(void *talloc_ctx,
 {
     assert(talloc_ctx);
 
-    const char *force_configdir = getenv("MPV_HOME");
-    if (global->opts->force_configdir && global->opts->force_configdir[0])
-        force_configdir = global->opts->force_configdir;
-    if (!global->opts->load_config)
-        force_configdir = "";
-    if (force_configdir) {
+    if (global->configdir) {
         for (int n = 0; n < MP_ARRAY_SIZE(config_dirs); n++) {
             if (strcmp(config_dirs[n], type) == 0)
-                return (n == 0 && force_configdir[0]) ? force_configdir : NULL;
+                return (n == 0 && global->configdir[0]) ? global->configdir : NULL;
         }
     }
 
@@ -245,30 +255,38 @@ char *mp_splitext(const char *path, bstr *root)
     return (char *)split + 1;
 }
 
+bool mp_path_is_absolute(struct bstr path)
+{
+    if (path.len && strchr(mp_path_separators, path.start[0]))
+        return true;
+
+#if HAVE_DOS_PATHS
+    // Note: "X:filename" is a path relative to the current working directory
+    //       of drive X, and thus is not an absolute path. It needs to be
+    //       followed by \ or /.
+    if (path.len >= 3 && path.start[1] == ':' &&
+        strchr(mp_path_separators, path.start[2]))
+        return true;
+#endif
+
+    return false;
+}
+
 char *mp_path_join_bstr(void *talloc_ctx, struct bstr p1, struct bstr p2)
 {
-    bool test;
     if (p1.len == 0)
         return bstrdup0(talloc_ctx, p2);
     if (p2.len == 0)
         return bstrdup0(talloc_ctx, p1);
 
-#if HAVE_DOS_PATHS
-    test = (p2.len >= 2 && p2.start[1] == ':')
-        || p2.start[0] == '\\' || p2.start[0] == '/';
-#else
-    test = p2.start[0] == '/';
-#endif
-    if (test)
-        return bstrdup0(talloc_ctx, p2);   // absolute path
+    if (mp_path_is_absolute(p2))
+        return bstrdup0(talloc_ctx, p2);
 
-    bool have_separator;
-    int endchar1 = p1.start[p1.len - 1];
+    bool have_separator = strchr(mp_path_separators, p1.start[p1.len - 1]);
 #if HAVE_DOS_PATHS
-    have_separator = endchar1 == '/' || endchar1 == '\\'
-                     || (p1.len == 2 && endchar1 == ':'); // "X:" only
-#else
-    have_separator = endchar1 == '/';
+    // "X:" only => path relative to "X:" current working directory.
+    if (p1.len == 2 && p1.start[1] == ':')
+        have_separator = true;
 #endif
 
     return talloc_asprintf(talloc_ctx, "%.*s%s%.*s", BSTR_P(p1),
@@ -315,12 +333,15 @@ bool mp_is_url(bstr path)
     int proto = bstr_find0(path, "://");
     if (proto < 1)
         return false;
-    // The protocol part must be alphanumeric, otherwise it's not an URL.
+    // Per RFC3986, the first character of the protocol must be alphabetic.
+    // The rest must be alphanumeric plus -, + and .
     for (int i = 0; i < proto; i++) {
         unsigned char c = path.start[i];
-        if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
-            !(c >= '0' && c <= '9') && c != '_')
+        if ((i == 0 && !mp_isalpha(c)) ||
+            (!mp_isalnum(c) && c != '.' && c != '-' && c != '+'))
+        {
             return false;
+        }
     }
     return true;
 }

@@ -71,6 +71,7 @@ enum dither_algo {
     DITHER_NONE = 0,
     DITHER_FRUIT,
     DITHER_ORDERED,
+    DITHER_ERROR_DIFFUSION,
 };
 
 enum alpha_mode {
@@ -93,10 +94,22 @@ enum tone_mapping {
     TONE_MAPPING_HABLE,
     TONE_MAPPING_GAMMA,
     TONE_MAPPING_LINEAR,
+    TONE_MAPPING_BT_2390,
 };
 
-// How many frames to average over for HDR peak detection
-#define PEAK_DETECT_FRAMES 63
+struct gl_tone_map_opts {
+    int curve;
+    float curve_param;
+    float max_boost;
+    int compute_peak;
+    float decay_rate;
+    float scene_threshold_low;
+    float scene_threshold_high;
+    float desat;
+    float desat_exp;
+    int gamut_warning; // bool
+    int gamut_clipping; // bool
+};
 
 struct gl_video_opts {
     int dumb_mode;
@@ -107,13 +120,10 @@ struct gl_video_opts {
     int target_prim;
     int target_trc;
     int target_peak;
-    int tone_mapping;
-    int compute_hdr_peak;
-    float tone_mapping_param;
-    float tone_mapping_desat;
-    int gamut_warning;
-    int linear_scaling;
+    struct gl_tone_map_opts tone_map;
     int correct_downscaling;
+    int linear_downscaling;
+    int linear_upscaling;
     int sigmoid_upscaling;
     float sigmoid_center;
     float sigmoid_slope;
@@ -124,6 +134,7 @@ struct gl_video_opts {
     int dither_size;
     int temporal_dither;
     int temporal_dither_period;
+    char *error_diffusion;
     char *fbo_format;
     int alpha_mode;
     int use_rectangle;
@@ -150,7 +161,8 @@ struct voctrl_screenshot;
 
 enum {
     RENDER_FRAME_SUBS = 1 << 0,
-    RENDER_FRAME_OSD = 2 << 0,
+    RENDER_FRAME_OSD = 1 << 1,
+    RENDER_FRAME_VF_SUBS = 1 << 2,
     RENDER_FRAME_DEF = RENDER_FRAME_SUBS | RENDER_FRAME_OSD,
 };
 

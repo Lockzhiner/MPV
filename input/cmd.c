@@ -18,24 +18,24 @@
 #include <stddef.h>
 
 #include "misc/bstr.h"
+#include "misc/node.h"
 #include "common/common.h"
 #include "common/msg.h"
 #include "options/m_option.h"
 
 #include "cmd.h"
 #include "input.h"
+#include "misc/json.h"
 
 #include "libmpv/client.h"
-
-const struct mp_cmd_def mp_cmd_list = {
-    .name = "list",
-};
 
 static void destroy_cmd(void *ptr)
 {
     struct mp_cmd *cmd = ptr;
-    for (int n = 0; n < cmd->nargs; n++)
-        m_option_free(cmd->args[n].type, &cmd->args[n].v);
+    for (int n = 0; n < cmd->nargs; n++) {
+        if (cmd->args[n].type)
+            m_option_free(cmd->args[n].type, &cmd->args[n].v);
+    }
 }
 
 struct flag {
@@ -52,7 +52,8 @@ static const struct flag cmd_flags[] = {
     {"expand-properties",   0,               MP_EXPAND_PROPERTIES},
     {"raw",                 MP_EXPAND_PROPERTIES, 0},
     {"repeatable",          0,               MP_ALLOW_REPEAT},
-    {"async",               0,               MP_ASYNC_CMD},
+    {"async",               MP_SYNC_CMD,     MP_ASYNC_CMD},
+    {"sync",                MP_ASYNC_CMD,     MP_SYNC_CMD},
     {0}
 };
 
@@ -114,34 +115,93 @@ static const struct m_option *get_arg_type(const struct mp_cmd_def *cmd, int i)
     return opt && opt->type ? opt : NULL;
 }
 
-// Verify that there are missing args, fill in missing optional args.
+// Return the name of the argument, possibly as stack allocated string (which is
+// why this is a macro, and out of laziness). Otherwise as get_arg_type().
+#define get_arg_name(cmd, i)                                    \
+    ((i) < MP_CMD_DEF_MAX_ARGS && (cmd)->args[(i)].name &&      \
+     (cmd)->args[(i)].name[0]                                   \
+     ? (cmd)->args[(i)].name : mp_tprintf(10, "%d", (i) + 1))
+
+// Verify that there are no missing args, fill in missing optional args.
 static bool finish_cmd(struct mp_log *log, struct mp_cmd *cmd)
 {
-    for (int i = cmd->nargs; i < MP_CMD_DEF_MAX_ARGS; i++) {
+    for (int i = 0; i < MP_CMD_DEF_MAX_ARGS; i++) {
+        // (type==NULL is used for yet unset arguments)
+        if (i < cmd->nargs && cmd->args[i].type)
+            continue;
         const struct m_option *opt = get_arg_type(cmd->def, i);
-        if (!opt || is_vararg(cmd->def, i))
+        if (i >= cmd->nargs && (!opt || is_vararg(cmd->def, i)))
             break;
         if (!opt->defval && !(opt->flags & MP_CMD_OPT_ARG)) {
-            mp_err(log, "Command %s: more than %d arguments required.\n",
-                    cmd->name, cmd->nargs);
+            mp_err(log, "Command %s: required argument %s not set.\n",
+                   cmd->name, get_arg_name(cmd->def, i));
             return false;
         }
         struct mp_cmd_arg arg = {.type = opt};
         if (opt->defval)
             m_option_copy(opt, &arg.v, opt->defval);
-        MP_TARRAY_APPEND(cmd, cmd->args, cmd->nargs, arg);
+        assert(i <= cmd->nargs);
+        if (i == cmd->nargs) {
+            MP_TARRAY_APPEND(cmd, cmd->args, cmd->nargs, arg);
+        } else {
+            cmd->args[i] = arg;
+        }
     }
+
+    if (!(cmd->flags & (MP_ASYNC_CMD | MP_SYNC_CMD)))
+        cmd->flags |= cmd->def->default_async ? MP_ASYNC_CMD : MP_SYNC_CMD;
+
     return true;
 }
 
-struct mp_cmd *mp_input_parse_cmd_node(struct mp_log *log, mpv_node *node)
+static bool set_node_arg(struct mp_log *log, struct mp_cmd *cmd, int i,
+                         mpv_node *val)
 {
-    struct mp_cmd *cmd = talloc_ptrtype(NULL, cmd);
-    talloc_set_destructor(cmd, destroy_cmd);
-    *cmd = (struct mp_cmd) { .scale = 1, .scale_units = 1 };
+    const char *name = get_arg_name(cmd->def, i);
 
-    if (node->format != MPV_FORMAT_NODE_ARRAY)
-        goto error;
+    const struct m_option *opt = get_arg_type(cmd->def, i);
+    if (!opt) {
+        mp_err(log, "Command %s: has only %d arguments.\n", cmd->name, i);
+        return false;
+    }
+
+    if (i < cmd->nargs && cmd->args[i].type) {
+        mp_err(log, "Command %s: argument %s was already set.\n", cmd->name, name);
+        return false;
+    }
+
+    struct mp_cmd_arg arg = {.type = opt};
+    void *dst = &arg.v;
+    if (val->format == MPV_FORMAT_STRING) {
+        int r = m_option_parse(log, opt, bstr0(cmd->name),
+                                bstr0(val->u.string), dst);
+        if (r < 0) {
+            mp_err(log, "Command %s: argument %s can't be parsed: %s.\n",
+                   cmd->name, name, m_option_strerror(r));
+            return false;
+        }
+    } else {
+        int r = m_option_set_node(opt, dst, val);
+        if (r < 0) {
+            mp_err(log, "Command %s: argument %s has incompatible type.\n",
+                   cmd->name, name);
+            return false;
+        }
+    }
+
+    // (leave unset arguments blank, to be set later or checked by finish_cmd())
+    while (i >= cmd->nargs) {
+        struct mp_cmd_arg t = {0};
+        MP_TARRAY_APPEND(cmd, cmd->args, cmd->nargs, t);
+    }
+
+    cmd->args[i] = arg;
+    return true;
+}
+
+static bool cmd_node_array(struct mp_log *log, struct mp_cmd *cmd, mpv_node *node)
+{
+    assert(node->format == MPV_FORMAT_NODE_ARRAY);
     mpv_node_list *args = node->u.list;
     int cur = 0;
 
@@ -157,46 +217,96 @@ struct mp_cmd *mp_input_parse_cmd_node(struct mp_log *log, mpv_node *node)
     if (cur < args->num && args->values[cur].format == MPV_FORMAT_STRING)
         cmd_name = bstr0(args->values[cur++].u.string);
     if (!find_cmd(log, cmd, cmd_name))
-        goto error;
+        return false;
 
     int first = cur;
     for (int i = 0; i < args->num - first; i++) {
-        const struct m_option *opt = get_arg_type(cmd->def, i);
-        if (!opt) {
-            mp_err(log, "Command %s: has only %d arguments.\n", cmd->name, i);
-            goto error;
-        }
-        mpv_node *val = &args->values[cur++];
-        struct mp_cmd_arg arg = {.type = opt};
-        void *dst = &arg.v;
-        if (val->format == MPV_FORMAT_STRING) {
-            int r = m_option_parse(log, opt, bstr0(cmd->name),
-                                   bstr0(val->u.string), dst);
-            if (r < 0) {
-                mp_err(log, "Command %s: argument %d can't be parsed: %s.\n",
-                       cmd->name, i + 1, m_option_strerror(r));
-                goto error;
-            }
-        } else {
-            int r = m_option_set_node(opt, dst, val);
-            if (r < 0) {
-                mp_err(log, "Command %s: argument %d has incompatible type.\n",
-                       cmd->name, i + 1);
-                goto error;
-            }
-        }
-        MP_TARRAY_APPEND(cmd, cmd->args, cmd->nargs, arg);
+        if (!set_node_arg(log, cmd, cmd->nargs, &args->values[cur++]))
+            return false;
     }
 
-    if (!finish_cmd(log, cmd))
-        goto error;
-
-    return cmd;
-error:
-    talloc_free(cmd);
-    return NULL;
+    return true;
 }
 
+static bool cmd_node_map(struct mp_log *log, struct mp_cmd *cmd, mpv_node *node)
+{
+    assert(node->format == MPV_FORMAT_NODE_MAP);
+    mpv_node_list *args = node->u.list;
+
+    mpv_node *name = node_map_get(node, "name");
+    if (!name || name->format != MPV_FORMAT_STRING)
+        return false;
+
+    if (!find_cmd(log, cmd, bstr0(name->u.string)))
+        return false;
+
+    if (cmd->def->vararg) {
+        mp_err(log, "Command %s: this command uses a variable number of "
+               "arguments, which does not work with named arguments.\n",
+               cmd->name);
+        return false;
+    }
+
+    for (int n = 0; n < args->num; n++) {
+        const char *key = args->keys[n];
+        mpv_node *val = &args->values[n];
+
+        if (strcmp(key, "name") == 0) {
+            // already handled above
+        } else if (strcmp(key, "_flags") == 0) {
+            if (val->format != MPV_FORMAT_NODE_ARRAY)
+                return false;
+            mpv_node_list *flags = val->u.list;
+            for (int i = 0; i < flags->num; i++) {
+                if (flags->values[i].format != MPV_FORMAT_STRING)
+                    return false;
+                if (!apply_flag(cmd, bstr0(flags->values[i].u.string)))
+                    return false;
+            }
+        } else {
+            int arg = -1;
+
+            for (int i = 0; i < MP_CMD_DEF_MAX_ARGS; i++) {
+                const char *arg_name = cmd->def->args[i].name;
+                if (arg_name && arg_name[0] && strcmp(key, arg_name) == 0) {
+                    arg = i;
+                    break;
+                }
+            }
+
+            if (arg < 0) {
+                mp_err(log, "Command %s: no argument %s.\n", cmd->name, key);
+                return false;
+            }
+
+            if (!set_node_arg(log, cmd, arg, val))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+struct mp_cmd *mp_input_parse_cmd_node(struct mp_log *log, mpv_node *node)
+{
+    struct mp_cmd *cmd = talloc_ptrtype(NULL, cmd);
+    talloc_set_destructor(cmd, destroy_cmd);
+    *cmd = (struct mp_cmd) { .scale = 1, .scale_units = 1 };
+
+    bool res = false;
+    if (node->format == MPV_FORMAT_NODE_ARRAY) {
+        res = cmd_node_array(log, cmd, node);
+    } else if (node->format == MPV_FORMAT_NODE_MAP) {
+        res = cmd_node_map(log, cmd, node);
+    }
+
+    res = res && finish_cmd(log, cmd);
+
+    if (!res)
+        TA_FREEP(&cmd);
+
+    return cmd;
+}
 
 static bool read_token(bstr str, bstr *out_rest, bstr *out_token)
 {
@@ -226,11 +336,34 @@ static int pctx_read_token(struct parse_ctx *ctx, bstr *out)
             return -1;
         }
         if (!bstr_eatstart0(&ctx->str, "\"")) {
-            MP_ERR(ctx, "Unterminated quotes: ...>%.*s<.\n", BSTR_P(start));
+            MP_ERR(ctx, "Unterminated double quote: ...>%.*s<.\n", BSTR_P(start));
             return -1;
         }
         return 1;
     }
+    if (bstr_eatstart0(&ctx->str, "'")) {
+        int next = bstrchr(ctx->str, '\'');
+        if (next < 0) {
+            MP_ERR(ctx, "Unterminated single quote: ...>%.*s<.\n", BSTR_P(start));
+            return -1;
+        }
+        *out = bstr_splice(ctx->str, 0, next);
+        ctx->str = bstr_cut(ctx->str, next+1);
+        return 1;
+    }
+    if (ctx->start.len > 1 && bstr_eatstart0(&ctx->str, "`")) {
+        char endquote[2] = {ctx->str.start[0], '`'};
+        ctx->str = bstr_cut(ctx->str, 1);
+        int next = bstr_find(ctx->str, (bstr){endquote, 2});
+        if (next < 0) {
+            MP_ERR(ctx, "Unterminated custom quote: ...>%.*s<.\n", BSTR_P(start));
+            return -1;
+        }
+        *out = bstr_splice(ctx->str, 0, next);
+        ctx->str = bstr_cut(ctx->str, next+2);
+        return 1;
+    }
+
     return read_token(ctx->str, &ctx->str, out) ? 1 : 0;
 }
 
@@ -304,7 +437,7 @@ static struct mp_cmd *parse_cmd_str(struct mp_log *log, void *tmp,
     }
 
     bstr orig = {ctx->start.start, ctx->str.start - ctx->start.start};
-    cmd->original = bstrdup(cmd, bstr_strip(orig));
+    cmd->original = bstrto0(cmd, bstr_strip(orig));
 
     *str = ctx->str;
     return cmd;
@@ -340,7 +473,6 @@ mp_cmd_t *mp_input_parse_cmd_str(struct mp_log *log, bstr str, const char *loc)
             *list = (struct mp_cmd) {
                 .name = (char *)mp_cmd_list.name,
                 .def = &mp_cmd_list,
-                .original = bstrdup(list, original),
             };
             talloc_steal(list, cmd);
             struct mp_cmd_arg arg = {0};
@@ -358,6 +490,16 @@ mp_cmd_t *mp_input_parse_cmd_str(struct mp_log *log, bstr str, const char *loc)
         talloc_steal(cmd, sub);
         *p_prev = sub;
         p_prev = &sub->queue_next;
+    }
+
+    cmd->original = bstrto0(cmd, bstr_strip(
+                        bstr_splice(original, 0, str.start - original.start)));
+
+    str = bstr_strip(str);
+    if (bstr_eatstart0(&str, "#") && !bstr_startswith0(str, "#")) {
+        str = bstr_strip(str);
+        if (str.len)
+            cmd->desc = bstrto0(cmd, str);
     }
 
 done:
@@ -400,8 +542,11 @@ mp_cmd_t *mp_cmd_clone(mp_cmd_t *cmd)
         ret->args[i].type = cmd->args[i].type;
         m_option_copy(ret->args[i].type, &ret->args[i].v, &cmd->args[i].v);
     }
-    ret->original = bstrdup(ret, cmd->original);
+    ret->original = talloc_strdup(ret, cmd->original);
+    ret->desc = talloc_strdup(ret, cmd->desc);
+    ret->sender = NULL;
     ret->key_name = talloc_strdup(ret, ret->key_name);
+    ret->key_text = talloc_strdup(ret, ret->key_text);
 
     if (cmd->def == &mp_cmd_list) {
         struct mp_cmd *prev = NULL;
@@ -422,6 +567,15 @@ mp_cmd_t *mp_cmd_clone(mp_cmd_t *cmd)
     return ret;
 }
 
+static int get_arg_count(const struct mp_cmd_def *cmd)
+{
+    for (int i = MP_CMD_DEF_MAX_ARGS - 1; i >= 0; i--) {
+        if (cmd->args[i].type)
+            return i + 1;
+    }
+    return 0;
+}
+
 void mp_cmd_dump(struct mp_log *log, int msgl, char *header, struct mp_cmd *cmd)
 {
     if (!mp_msg_test(log, msgl))
@@ -433,48 +587,31 @@ void mp_cmd_dump(struct mp_log *log, int msgl, char *header, struct mp_cmd *cmd)
         return;
     }
     mp_msg(log, msgl, "%s, flags=%d, args=[", cmd->name, cmd->flags);
+    int argc = get_arg_count(cmd->def);
     for (int n = 0; n < cmd->nargs; n++) {
+        const char *argname = cmd->def->args[MPMIN(n, argc - 1)].name;
         char *s = m_option_print(cmd->args[n].type, &cmd->args[n].v);
         if (n)
             mp_msg(log, msgl, ", ");
-        mp_msg(log, msgl, "%s", s ? s : "(NULL)");
+        struct mpv_node node = {
+            .format = MPV_FORMAT_STRING,
+            .u.string = s ? s : "(NULL)",
+        };
+        char *esc = NULL;
+        json_write(&esc, &node);
+        mp_msg(log, msgl, "%s=%s", argname, esc ? esc : "<error>");
+        talloc_free(esc);
         talloc_free(s);
     }
     mp_msg(log, msgl, "]\n");
 }
 
-// 0: no, 1: maybe, 2: sure
-static int is_abort_cmd(struct mp_cmd *cmd)
-{
-    if (cmd->def->is_abort)
-        return 2;
-    if (cmd->def->is_soft_abort)
-        return 1;
-    if (cmd->def == &mp_cmd_list) {
-        int r = 0;
-        for (struct mp_cmd *sub = cmd->args[0].v.p; sub; sub = sub->queue_next) {
-            int x = is_abort_cmd(sub);
-            r = MPMAX(r, x);
-        }
-        return r;
-    }
-    return 0;
-}
-
-bool mp_input_is_maybe_abort_cmd(struct mp_cmd *cmd)
-{
-    return is_abort_cmd(cmd) >= 1;
-}
-
-bool mp_input_is_abort_cmd(struct mp_cmd *cmd)
-{
-    return is_abort_cmd(cmd) >= 2;
-}
-
 bool mp_input_is_repeatable_cmd(struct mp_cmd *cmd)
 {
-    return (cmd->def->allow_auto_repeat) || cmd->def == &mp_cmd_list ||
-           (cmd->flags & MP_ALLOW_REPEAT);
+    if (cmd->def == &mp_cmd_list && cmd->args[0].v.p)
+        cmd = cmd->args[0].v.p;  // list - only 1st cmd is considered
+
+    return (cmd->def->allow_auto_repeat) || (cmd->flags & MP_ALLOW_REPEAT);
 }
 
 bool mp_input_is_scalable_cmd(struct mp_cmd *cmd)
@@ -488,12 +625,13 @@ void mp_print_cmd_list(struct mp_log *out)
         const struct mp_cmd_def *def = &mp_cmds[i];
         mp_info(out, "%-20.20s", def->name);
         for (int j = 0; j < MP_CMD_DEF_MAX_ARGS && def->args[j].type; j++) {
-            const char *type = def->args[j].type->name;
-            if (def->args[j].defval)
-                mp_info(out, " [%s]", type);
-            else
-                mp_info(out, " %s", type);
+            const struct m_option *arg = &def->args[j];
+            bool is_opt = arg->defval || (arg->flags & MP_CMD_OPT_ARG);
+            mp_info(out, " %s%s=%s%s", is_opt ? "[" : "", arg->name,
+                    arg->type->name, is_opt ? "]" : "");
         }
+        if (def->vararg)
+            mp_info(out, "..."); // essentially append to last argument
         mp_info(out, "\n");
     }
 }
@@ -513,6 +651,11 @@ static int parse_cycle_dir(struct mp_log *log, const struct m_option *opt,
     return 1;
 }
 
+static char *print_cycle_dir(const m_option_t *opt, const void *val)
+{
+    return talloc_asprintf(NULL, "%f", *(double *)val);
+}
+
 static void copy_opt(const m_option_t *opt, void *dst, const void *src)
 {
     if (dst && src)
@@ -522,6 +665,7 @@ static void copy_opt(const m_option_t *opt, void *dst, const void *src)
 const struct m_option_type m_option_type_cycle_dir = {
     .name = "up|down",
     .parse = parse_cycle_dir,
+    .print = print_cycle_dir,
     .copy = copy_opt,
     .size = sizeof(double),
 };

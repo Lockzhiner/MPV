@@ -17,21 +17,17 @@
  * with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <errno.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 
 #include <libavutil/common.h>
-#include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_drm.h>
 
 #include "config.h"
 
@@ -67,18 +63,6 @@
 
 #define MAX_BUFFERS 10
 
-#define XV_DMA_CLIENT_PROP      "XV_DMA_CLIENT_ID"
-#define XV_DMA_VER_STRIDE_PROP  "XV_DMA_VER_STRIDE"
-#define XV_DMA_HOR_STRIDE_PROP  "XV_DMA_HOR_STRIDE"
-#define XV_DMA_CLIENT_PATH      "/tmp/.xv_dma_client"
-
-struct dma_desc {
-    int hor_stride;
-    int ver_stride;
-    int dma_fd;
-    int valid;
-};
-
 struct xvctx {
     struct xv_ck_info_s {
         int method; // CK_METHOD_* constants
@@ -96,8 +80,6 @@ struct xvctx {
     int current_ip_buf;
     int num_buffers;
     XvImage *xvimage[MAX_BUFFERS];
-    struct dma_desc dma_descs[MAX_BUFFERS];
-    int dma_client_id;
     struct mp_image *original_image;
     uint32_t image_width;
     uint32_t image_height;
@@ -119,7 +101,6 @@ struct xvctx {
 #define MP_FOURCC_I420  MP_FOURCC('I', '4', '2', '0')
 #define MP_FOURCC_IYUV  MP_FOURCC('I', 'Y', 'U', 'V')
 #define MP_FOURCC_UYVY  MP_FOURCC('U', 'Y', 'V', 'Y')
-#define MP_FOURCC_NV12  MP_FOURCC('N', 'V', '1', '2')
 
 struct fmt_entry {
     int imgfmt;
@@ -129,8 +110,6 @@ static const struct fmt_entry fmt_table[] = {
     {IMGFMT_420P,       MP_FOURCC_YV12},
     {IMGFMT_420P,       MP_FOURCC_I420},
     {IMGFMT_UYVY,       MP_FOURCC_UYVY},
-    {IMGFMT_NV12,       MP_FOURCC_NV12},
-    {IMGFMT_DRMPRIME,   MP_FOURCC_NV12},
     {0}
 };
 
@@ -195,144 +174,6 @@ static int xv_find_atom(struct vo *vo, uint32_t xv_port, const char *name,
     }
     XFree(attributes);
     return atom;
-}
-
-static int xv_check_dma_client(struct vo *vo)
-{
-    struct xvctx *ctx = vo->priv;
-    Atom atom;
-    int xv_value = 0;
-
-    if (!ctx->dma_client_id)
-        return -1;
-
-    atom = XInternAtom(vo->x11->display, XV_DMA_CLIENT_PROP, True);
-    if (atom != None)
-        XvGetPortAttribute(vo->x11->display, ctx->xv_port, atom, &xv_value);
-
-    if (xv_value)
-        return 0;
-
-    ctx->dma_client_id = 0;
-    return -1;
-}
-
-static void xv_flush_dma_client(struct vo *vo)
-{
-    struct xvctx *ctx = vo->priv;
-    Atom atom;
-
-    if (!ctx->dma_client_id)
-        return;
-
-    atom = XInternAtom(vo->x11->display, XV_DMA_CLIENT_PROP, True);
-    if (atom != None) {
-        XvSetPortAttribute(vo->x11->display, ctx->xv_port,
-                           atom, ctx->dma_client_id);
-        XvGetPortAttribute(vo->x11->display, ctx->xv_port, atom,
-                           &ctx->dma_client_id);
-    }
-}
-
-static void xv_disable_dma_client(struct vo *vo)
-{
-    struct xvctx *ctx = vo->priv;
-    Atom atom;
-
-    if (!ctx->dma_client_id)
-        return;
-
-    atom = XInternAtom(vo->x11->display, XV_DMA_CLIENT_PROP, True);
-    if (atom != None)
-        XvSetPortAttribute(vo->x11->display, ctx->xv_port, atom, 0);
-
-    ctx->dma_client_id = 0;
-}
-
-static void xv_send_dma_params(struct vo *vo, int hor_stride, int ver_stride)
-{
-    struct xvctx *ctx = vo->priv;
-    Atom atom;
-
-    if (!ctx->dma_client_id)
-        return;
-
-    atom = XInternAtom(vo->x11->display, XV_DMA_HOR_STRIDE_PROP, True);
-    if (atom == None)
-        goto failed;
-
-    XvSetPortAttribute(vo->x11->display, ctx->xv_port, atom, hor_stride);
-
-    atom = XInternAtom(vo->x11->display, XV_DMA_VER_STRIDE_PROP, True);
-    if (atom == None)
-        goto failed;
-
-    XvSetPortAttribute(vo->x11->display, ctx->xv_port, atom, ver_stride);
-
-    return;
-
-failed:
-    xv_disable_dma_client(vo);
-    ctx->dma_client_id = 0;
-}
-
-static void xv_send_dma_fd(struct vo *vo, int dma_fd)
-{
-    struct xvctx *ctx = vo->priv;
-    struct sockaddr_un addr;
-    struct iovec iov;
-    struct msghdr msg;
-    struct cmsghdr *header;
-    char buf[CMSG_SPACE(sizeof(int))];
-    int socket_fd;
-
-    if (!ctx->dma_client_id)
-        return;
-
-    xv_flush_dma_client(vo);
-
-    socket_fd = socket(PF_UNIX, SOCK_DGRAM, 0);
-    if (socket_fd < 0)
-        goto failed;
-
-    addr.sun_family = AF_LOCAL;
-    snprintf(addr.sun_path, sizeof (addr.sun_path),
-             XV_DMA_CLIENT_PATH ".%d", ctx->dma_client_id);
-    addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
-
-    if (connect(socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-        goto failed;
-
-    iov.iov_base = buf;
-    iov.iov_len = 1;
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-    msg.msg_name = NULL;
-    msg.msg_namelen = 0;
-
-    header = CMSG_FIRSTHDR(&msg);
-    header->cmsg_level = SOL_SOCKET;
-    header->cmsg_type = SCM_RIGHTS;
-
-    header->cmsg_len = CMSG_LEN(sizeof(int));
-    *((int *)CMSG_DATA(header)) = dma_fd;
-    sendmsg(socket_fd, &msg, 0);
-
-    /* Send am empty msg at the end */
-    header->cmsg_len = CMSG_LEN(0);
-    sendmsg(socket_fd, &msg, 0);
-
-    close(socket_fd);
-    return;
-
-failed:
-    xv_disable_dma_client(vo);
-
-    if (socket_fd >= 0)
-        close(socket_fd);
 }
 
 static int xv_set_eq(struct vo *vo, uint32_t xv_port, const char *name,
@@ -666,10 +507,8 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     MP_VERBOSE(vo, "using Xvideo port %d for hw scaling\n", ctx->xv_port);
 
     // In case config has been called before
-    for (i = 0; i < ctx->num_buffers; i++) {
+    for (i = 0; i < ctx->num_buffers; i++)
         deallocate_xvimage(vo, i);
-        ctx->dma_descs[i].valid = 0;
-    }
 
     ctx->num_buffers = ctx->cfg_buffers;
 
@@ -843,14 +682,6 @@ static void wait_for_completion(struct vo *vo, int max_outstanding)
 static void flip_page(struct vo *vo)
 {
     struct xvctx *ctx = vo->priv;
-    struct dma_desc *dma_desc = &ctx->dma_descs[ctx->current_buf];
-
-    if (dma_desc->valid) {
-        xv_send_dma_fd(vo, dma_desc->dma_fd);
-        xv_send_dma_params(vo, dma_desc->hor_stride, dma_desc->ver_stride);
-        dma_desc->valid = 0;
-    }
-
     put_xvimage(vo, ctx->xvimage[ctx->current_buf]);
 
     /* remember the currently visible buffer */
@@ -869,26 +700,6 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
 
     struct mp_image xv_buffer = get_xv_buffer(vo, ctx->current_buf);
     if (mpi) {
-        if (mpi->hwctx && !xv_check_dma_client(vo)) {
-            AVHWFramesContext *fctx = (void *)mpi->hwctx->data;
-            if (fctx->format == AV_PIX_FMT_DRM_PRIME &&
-                fctx->sw_format == AV_PIX_FMT_NV12) {
-                AVDRMFrameDescriptor *desc =
-                    (AVDRMFrameDescriptor *)mpi->planes[0];
-                AVDRMLayerDescriptor *layer = &desc->layers[0];
-                struct dma_desc *dma_desc = &ctx->dma_descs[ctx->current_buf];
-
-                dma_desc->hor_stride = layer->planes[0].pitch;
-                dma_desc->ver_stride =
-                    layer->planes[1].offset / dma_desc->hor_stride;
-                dma_desc->dma_fd = desc->objects[0].fd;
-                dma_desc->valid = 1;
-
-                // TODO: Draw osd on mmapped hw frame
-                goto out;
-            }
-        }
-
         mp_image_copy(&xv_buffer, mpi);
     } else {
         mp_image_clear(&xv_buffer, 0, 0, xv_buffer.w, xv_buffer.h);
@@ -897,7 +708,6 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
     struct mp_osd_res res = osd_res_from_image_params(vo->params);
     osd_draw_on_image(vo->osd, res, mpi ? mpi->pts : 0, 0, &xv_buffer);
 
-out:
     if (mpi != ctx->original_image) {
         talloc_free(ctx->original_image);
         ctx->original_image = mpi;
@@ -1036,9 +846,6 @@ static int preinit(struct vo *vo)
     ctx->fo = XvListImageFormats(x11->display, ctx->xv_port,
                                  (int *) &ctx->formats);
 
-    ctx->dma_client_id = getpid();
-    xv_flush_dma_client(vo);
-
     MP_WARN(vo, "Warning: this legacy VO has bad quality and performance, "
                 "and will in particular result in blurry OSD and subtitles. "
                 "You should fix your graphics drivers, or not force the xv VO.\n");
@@ -1091,20 +898,20 @@ const struct vo_driver video_out_xv = {
         .cfg_buffers = 2,
     },
     .options = (const struct m_option[]) {
-        OPT_INT("port", xv_port, M_OPT_MIN, .min = 0),
-        OPT_INT("adaptor", cfg_xv_adaptor, M_OPT_MIN, .min = -1),
-        OPT_CHOICE("ck", xv_ck_info.source, 0,
-                   ({"use", CK_SRC_USE},
-                    {"set", CK_SRC_SET},
-                    {"cur", CK_SRC_CUR})),
-        OPT_CHOICE("ck-method", xv_ck_info.method, 0,
-                   ({"none", CK_METHOD_NONE},
-                    {"bg", CK_METHOD_BACKGROUND},
-                    {"man", CK_METHOD_MANUALFILL},
-                    {"auto", CK_METHOD_AUTOPAINT})),
-        OPT_INT("colorkey", colorkey, 0),
-        OPT_INTRANGE("buffers", cfg_buffers, 0, 1, MAX_BUFFERS),
-        OPT_REMOVED("no-colorkey", "use ck-method=none instead"),
+        {"port", OPT_INT(xv_port), M_RANGE(0, DBL_MAX)},
+        {"adaptor", OPT_INT(cfg_xv_adaptor), M_RANGE(-1, DBL_MAX)},
+        {"ck", OPT_CHOICE(xv_ck_info.source,
+            {"use", CK_SRC_USE},
+            {"set", CK_SRC_SET},
+            {"cur", CK_SRC_CUR})},
+        {"ck-method", OPT_CHOICE(xv_ck_info.method,
+            {"none", CK_METHOD_NONE},
+            {"bg", CK_METHOD_BACKGROUND},
+            {"man", CK_METHOD_MANUALFILL},
+            {"auto", CK_METHOD_AUTOPAINT})},
+        {"colorkey", OPT_INT(colorkey)},
+        {"buffers", OPT_INT(cfg_buffers), M_RANGE(1, MAX_BUFFERS)},
+        {"no-colorkey", OPT_REMOVED("use ck-method=none instead")},
         {0}
     },
     .options_prefix = "xv",

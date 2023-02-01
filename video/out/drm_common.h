@@ -29,6 +29,7 @@
 
 struct kms {
     struct mp_log *log;
+    char *primary_node_path;
     int fd;
     drmModeConnector *connector;
     drmModeEncoder *encoder;
@@ -46,12 +47,28 @@ struct vt_switcher {
 };
 
 struct drm_opts {
+    char *drm_device_path;
     char *drm_connector_spec;
-    int drm_mode_id;
-    int drm_osd_plane_id;
-    int drm_video_plane_id;
+    char *drm_mode_spec;
+    int drm_atomic;
+    int drm_draw_plane;
+    int drm_drmprime_video_plane;
     int drm_format;
-    struct m_geometry drm_osd_size;
+    struct m_geometry drm_draw_surface_size;
+};
+
+struct drm_vsync_tuple {
+    uint64_t ust;
+    unsigned int msc;
+    unsigned int sbc;
+};
+
+struct drm_pflip_cb_closure {
+    struct drm_vsync_tuple *frame_vsync; // vsync tuple when the frame that just flipped was queued
+    struct drm_vsync_tuple *vsync; // vsync tuple of the latest page flip. drm_pflip_cb updates this
+    struct vo_vsync_info *vsync_info; // where the drm_pflip_cb routine writes its output
+    bool *waiting_for_flip; // drm_pflip_cb writes false here before returning
+    struct mp_log *log; // Needed to print error messages that shame bad drivers
 };
 
 bool vt_switcher_init(struct vt_switcher *s, struct mp_log *log);
@@ -64,17 +81,17 @@ void vt_switcher_acquire(struct vt_switcher *s, void (*handler)(void*),
 void vt_switcher_release(struct vt_switcher *s, void (*handler)(void*),
                          void *user_data);
 
-struct kms *kms_create(struct mp_log *log, const char *connector_spec,
-                       int mode_id, int osd_plane_id, int video_plane_id);
+struct kms *kms_create(struct mp_log *log,
+                       const char *drm_device_path,
+                       const char *connector_spec,
+                       const char *mode_spec,
+                       int draw_plane, int drmprime_video_plane,
+                       bool use_atomic);
 void kms_destroy(struct kms *kms);
 double kms_get_display_fps(const struct kms *kms);
 
-void kms_show_available_connectors(struct mp_log *log, int card_no);
-void kms_show_available_modes(struct mp_log *log,
-                              const drmModeConnector *connector);
-void kms_show_available_cards_and_connectors(struct mp_log *log);
-
-int drm_validate_connector_opt(struct mp_log *log, const struct m_option *opt,
-                               struct bstr name, struct bstr param);
+// DRM Page Flip callback
+void drm_pflip_cb(int fd, unsigned int msc, unsigned int sec,
+                  unsigned int usec, void *data);
 
 #endif

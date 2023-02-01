@@ -124,6 +124,12 @@ static int ra_init_gl(struct ra *ra, GL *gl)
     if (gl->BlitFramebuffer)
         ra->caps |= RA_CAP_BLIT;
 
+    // Disable compute shaders for GLSL < 420. This work-around is needed since
+    // some buggy OpenGL drivers expose compute shaders for lower GLSL versions,
+    // despite the spec requiring 420+.
+    if (ra->glsl_version < 420)
+        ra->caps &= ~RA_CAP_COMPUTE;
+
     int gl_fmt_features = gl_format_feature_flags(gl);
 
     for (int n = 0; gl_formats[n].internal_format; n++) {
@@ -144,6 +150,9 @@ static int ra_init_gl(struct ra *ra, GL *gl)
             .linear_filter  = gl_fmt->flags & F_TF,
             .renderable     = (gl_fmt->flags & F_CR) &&
                               (gl->mpgl_caps & MPGL_CAP_FB),
+            // TODO: Check whether it's a storable format
+            // https://www.khronos.org/opengl/wiki/Image_Load_Store
+            .storable       = true,
         };
 
         int csize = gl_component_size(gl_fmt->type) * 8;
@@ -171,6 +180,17 @@ static int ra_init_gl(struct ra *ra, GL *gl)
             desc->planes[0] = fmt;
             for (int i = 0; i < 3; i++)
                 desc->components[0][i] = i + 1;
+            desc->chroma_w = desc->chroma_h = 1;
+        }
+        if (strcmp(fmt->name, "rgb10_a2") == 0) {
+            fmt->special_imgfmt = IMGFMT_RGB30;
+            struct ra_imgfmt_desc *desc = talloc_zero(fmt, struct ra_imgfmt_desc);
+            fmt->special_imgfmt_desc = desc;
+            desc->component_bits = 10;
+            desc->num_planes = 1;
+            desc->planes[0] = fmt;
+            for (int i = 0; i < 3; i++)
+                desc->components[0][i] = 3 - i;
             desc->chroma_w = desc->chroma_h = 1;
         }
         if (strcmp(fmt->name, "appleyp") == 0) {
@@ -542,7 +562,9 @@ static void gl_buf_destroy(struct ra *ra, struct ra_buf *buf)
     GL *gl = ra_gl_get(ra);
     struct ra_buf_gl *buf_gl = buf->priv;
 
-    gl->DeleteSync(buf_gl->fence);
+    if (buf_gl->fence)
+        gl->DeleteSync(buf_gl->fence);
+
     if (buf->data) {
         gl->BindBuffer(buf_gl->target, buf_gl->buffer);
         gl->UnmapBuffer(buf_gl->target);
@@ -685,7 +707,7 @@ static void gl_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
     gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 }
 
-static int gl_desc_namespace(enum ra_vartype type)
+static int gl_desc_namespace(struct ra *ra, enum ra_vartype type)
 {
     return type;
 }
@@ -967,7 +989,7 @@ static void update_uniform(struct ra *ra, struct ra_renderpass *pass,
         gl->BindBufferBase(buf_gl->target, input->binding, buf_gl->buffer);
         // SSBOs are not implicitly coherent in OpengL
         if (input->type == RA_VARTYPE_BUF_RW)
-            gl->MemoryBarrier(buf_gl->target);
+            gl->MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         break;
     }
     default:

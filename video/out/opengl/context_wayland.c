@@ -25,6 +25,8 @@
 #include "egl_helpers.h"
 #include "utils.h"
 
+#define EGL_PLATFORM_WAYLAND_EXT 0x31D8
+
 struct priv {
     GL gl;
     EGLDisplay egl_display;
@@ -41,20 +43,55 @@ static void resize(struct ra_ctx *ctx)
 
     MP_VERBOSE(wl, "Handling resize on the egl side\n");
 
-    const int32_t width = wl->scaling*mp_rect_w(wl->geometry);
-    const int32_t height = wl->scaling*mp_rect_h(wl->geometry);
+    const int32_t width = wl->scaling * mp_rect_w(wl->geometry);
+    const int32_t height = wl->scaling * mp_rect_h(wl->geometry);
 
-    wl_surface_set_buffer_scale(wl->surface, wl->scaling);
-    wl_egl_window_resize(p->egl_window, width, height, 0, 0);
+    vo_wayland_set_opaque_region(wl, ctx->opts.want_alpha);
+    if (p->egl_window)
+        wl_egl_window_resize(p->egl_window, width, height, 0, 0);
 
     wl->vo->dwidth  = width;
     wl->vo->dheight = height;
 }
 
-static void wayland_egl_swap_buffers(struct ra_ctx *ctx)
+static bool wayland_egl_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
 {
+    struct ra_ctx *ctx = sw->ctx;
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    bool render = !wl->hidden || wl->opts->disable_vsync;
+    wl->frame_wait = true;
+
+    return render ? ra_gl_ctx_start_frame(sw, out_fbo) : false;
+}
+
+static void wayland_egl_swap_buffers(struct ra_swapchain *sw)
+{
+    struct ra_ctx *ctx = sw->ctx;
     struct priv *p = ctx->priv;
+    struct vo_wayland_state *wl = ctx->vo->wl;
+
     eglSwapBuffers(p->egl_display, p->egl_surface);
+
+    if (!wl->opts->disable_vsync)
+        vo_wayland_wait_frame(wl);
+
+    if (wl->presentation)
+        vo_wayland_sync_swap(wl);
+}
+
+static const struct ra_swapchain_fns wayland_egl_swapchain = {
+    .start_frame  = wayland_egl_start_frame,
+    .swap_buffers = wayland_egl_swap_buffers,
+};
+
+static void wayland_egl_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
+{
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    if (wl->presentation) {
+        info->vsync_duration = wl->vsync_duration;
+        info->skipped_vsyncs = wl->last_skipped_vsyncs;
+        info->last_queue_display_time = wl->last_queue_display_time;
+    }
 }
 
 static bool egl_create_context(struct ra_ctx *ctx)
@@ -62,7 +99,9 @@ static bool egl_create_context(struct ra_ctx *ctx)
     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
     struct vo_wayland_state *wl = ctx->vo->wl;
 
-    if (!(p->egl_display = eglGetDisplay(wl->display)))
+    if (!(p->egl_display = mpegl_get_display(EGL_PLATFORM_WAYLAND_EXT,
+                                             "EGL_EXT_platform_wayland",
+                                             wl->display)))
         return false;
 
     if (eglInitialize(p->egl_display, NULL, NULL) != EGL_TRUE)
@@ -77,7 +116,8 @@ static bool egl_create_context(struct ra_ctx *ctx)
     mpegl_load_functions(&p->gl, wl->log);
 
     struct ra_gl_ctx_params params = {
-        .swap_buffers = wayland_egl_swap_buffers,
+        .external_swapchain = &wayland_egl_swapchain,
+        .get_vsync          = &wayland_egl_get_vsync,
     };
 
     if (!ra_gl_ctx_init(ctx, &p->gl, params))
@@ -161,21 +201,31 @@ static void wayland_egl_wait_events(struct ra_ctx *ctx, int64_t until_time_us)
     vo_wayland_wait_events(ctx->vo, until_time_us);
 }
 
+static void wayland_egl_update_render_opts(struct ra_ctx *ctx)
+{
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    vo_wayland_set_opaque_region(wl, ctx->opts.want_alpha);
+    wl_surface_commit(wl->surface);
+}
+
 static bool wayland_egl_init(struct ra_ctx *ctx)
 {
-    if (!vo_wayland_init(ctx->vo))
+    if (!vo_wayland_init(ctx->vo)) {
+        vo_wayland_uninit(ctx->vo);
         return false;
+    }
 
     return egl_create_context(ctx);
 }
 
 const struct ra_ctx_fns ra_ctx_wayland_egl = {
-    .type           = "opengl",
-    .name           = "wayland",
-    .reconfig       = wayland_egl_reconfig,
-    .control        = wayland_egl_control,
-    .wakeup         = wayland_egl_wakeup,
-    .wait_events    = wayland_egl_wait_events,
-    .init           = wayland_egl_init,
-    .uninit         = wayland_egl_uninit,
+    .type               = "opengl",
+    .name               = "wayland",
+    .reconfig           = wayland_egl_reconfig,
+    .control            = wayland_egl_control,
+    .wakeup             = wayland_egl_wakeup,
+    .wait_events        = wayland_egl_wait_events,
+    .update_render_opts = wayland_egl_update_render_opts,
+    .init               = wayland_egl_init,
+    .uninit             = wayland_egl_uninit,
 };

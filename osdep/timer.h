@@ -37,13 +37,18 @@ uint64_t mp_raw_time_us(void);
 // Sleep in microseconds.
 void mp_sleep_us(int64_t us);
 
+#ifdef _WIN32
+// returns: timer resolution in ms if needed and started successfully, else 0
+int mp_start_hires_timers(int wait_ms);
+
+// call unconditionally with the return value of mp_start_hires_timers
+void mp_end_hires_timers(int resolution_ms);
+#endif  /* _WIN32 */
+
 #define MP_START_TIME 10000000
 
-// Return the amount of time that has passed since the last call, in
-// microseconds. *t is used to calculate the time that has passed by storing
-// the current time in it. If *t is 0, the call will return 0. (So that the
-// first call will return 0, instead of the absolute current time.)
-int64_t mp_time_relative_us(int64_t *t);
+// Duration of a second in mpv time.
+#define MP_SECOND_US (1000 * 1000)
 
 // Add a time in seconds to the given time in microseconds, and return it.
 // Takes care of possible overflows. Never returns a negative or 0 time.
